@@ -4,8 +4,10 @@ bootstrap.ps1 (student-proof, self-healing)
 Run this on the Talos CTL VM (inside the isolated lab network).
 
 Behavior:
-- If cluster is reachable via kubectl: installs MetalLB + ingress-nginx + sample app.
-- If cluster is NOT reachable: automatically wipes (reset) all nodes and rebuilds Talos + Kubernetes, then installs.
+- Prompts for IPs (defaults provided).
+- If cluster is healthy via kubectl: installs MetalLB + ingress-nginx + sample app.
+- If cluster is NOT healthy: automatically wipes (reset) ALL nodes and rebuilds Talos + Kubernetes, then installs.
+- Handles Talos "tls: certificate required" automatically by retrying apply-config securely.
 
 Defaults:
   CP  = 192.168.1.3
@@ -16,6 +18,7 @@ Defaults:
 Usage:
   .\bootstrap.ps1
   .\bootstrap.ps1 -ControlPlaneIP 192.168.1.13 -WorkerIPs 192.168.1.15,192.168.1.16 -VipIP 192.168.1.210
+  .\bootstrap.ps1 -ForceRebuild
 #>
 
 [CmdletBinding()]
@@ -157,32 +160,49 @@ function Set-TalosContext {
 }
 
 function Apply-NodeConfig {
-  param([string]$ip,[string]$role,[string]$cp)
+  param(
+    [Parameter(Mandatory=$true)][string]$ip,
+    [Parameter(Mandatory=$true)][ValidateSet("controlplane","worker")][string]$role,
+    [Parameter(Mandatory=$true)][string]$cp
+  )
 
-  $file = if ($role -eq "controlplane") { Join-Path $OverridesDir "controlplane.yaml" } else { Join-Path $OverridesDir "worker.yaml" }
+  $file = if ($role -eq "controlplane") {
+    Join-Path $OverridesDir "controlplane.yaml"
+  } else {
+    Join-Path $OverridesDir "worker.yaml"
+  }
+
   if (-not (Test-Path $file)) { throw "Missing ${role} config file: $file" }
 
   Write-Host "Applying ${role} config to ${ip} ..." -ForegroundColor Gray
 
-  # Try insecure first (common for fresh/reset nodes)
-  $out = talosctl apply-config --insecure --nodes $ip --endpoints $cp --file $file 2>&1 | Out-String
-  if ($LASTEXITCODE -eq 0) { return }
+  # --- Attempt 1: insecure (fresh/reset nodes)
+  $out = & talosctl apply-config --insecure --nodes $ip --endpoints $cp --file $file 2>&1
+  $exit = $LASTEXITCODE
 
-  # If Talos now requires TLS, retry secure
-  if ($out -match "certificate required") {
-    Write-Host "TLS required; retrying apply-config securely..." -ForegroundColor Yellow
-    talosctl apply-config --nodes $ip --endpoints $cp --file $file 2>&1 | Out-String | Out-Null
-    if ($LASTEXITCODE -eq 0) { return }
+  if ($exit -eq 0) { return }
+
+  $outText = ($out | Out-String)
+
+  # --- If Talos requires TLS now, retry securely (uses $env:TALOSCONFIG)
+  if ($outText -match "tls:\s*certificate required" -or $outText -match "certificate required") {
+    Write-Host "TLS required on ${ip}; retrying apply-config securely..." -ForegroundColor Yellow
+
+    $out2 = & talosctl apply-config --nodes $ip --endpoints $cp --file $file 2>&1
+    $exit2 = $LASTEXITCODE
+    if ($exit2 -eq 0) { return }
+
+    $out2Text = ($out2 | Out-String)
+    throw "apply-config failed for ${ip} (secure retry also failed):`n$out2Text"
   }
 
-  throw "apply-config failed for ${ip}:`n$out"
+  throw "apply-config failed for ${ip}:`n$outText"
 }
 
 function Get-EtcdServiceLine {
   try {
     $lines = talosctl service 2>$null
     if (-not $lines) { return $null }
-    # keep it simple: find a line that contains 'etcd'
     foreach ($l in $lines) {
       if ($l -match "\betcd\b") { return $l }
     }
@@ -201,20 +221,18 @@ function Reset-Nodes {
 
   Show-Header "RESET: Wiping Talos STATE + EPHEMERAL on all nodes (fresh start)" "Yellow"
   Write-Host ("Nodes: {0}" -f ($Ips -join ", ")) -ForegroundColor Yellow
-  Write-Host "This is expected in the lab if anything breaks. Continuing..." -ForegroundColor DarkGray
+  Write-Host "Lab safe mode: if anything breaks, this rebuilds from scratch." -ForegroundColor DarkGray
 
-  # Reset all nodes (best effort)
   foreach ($ip in $Ips) {
     try {
       Write-Host "Resetting ${ip} ..." -ForegroundColor Gray
-      talosctl reset --nodes $ip --graceful=false --reboot `
+      & talosctl reset --nodes $ip --graceful=false --reboot `
         --system-labels-to-wipe STATE --system-labels-to-wipe EPHEMERAL 2>$null | Out-Null
     } catch {
       Write-Host "Reset command failed on ${ip} (continuing). It may already be rebooting." -ForegroundColor DarkGray
     }
   }
 
-  # Wait for Talos API (50000) to come back on control plane at least
   Write-Host ""
   Write-Host "Waiting for Talos API (port 50000) on control plane..." -ForegroundColor Yellow
   $ok = Wait-ForPort -Ip $ControlPlaneIP -Port 50000 -TimeoutSeconds $TimeoutTalosApiSeconds -Label "Talos API"
@@ -228,7 +246,7 @@ function Generate-TalosConfigs {
   Clear-GeneratedFiles
 
   Show-Header "[1/6] Generating Talos configs" "Yellow"
-  talosctl gen config $ClusterName "https://${ControlPlaneIP}:6443" --output-dir $OverridesDir | Out-Null
+  & talosctl gen config $ClusterName "https://${ControlPlaneIP}:6443" --output-dir $OverridesDir | Out-Null
 
   if (-not (Test-Path (Join-Path $OverridesDir "controlplane.yaml"))) { throw "controlplane.yaml was not generated." }
   if (-not (Test-Path (Join-Path $OverridesDir "worker.yaml")))      { throw "worker.yaml was not generated." }
@@ -239,19 +257,19 @@ function Generate-TalosConfigs {
 
 function Bootstrap-TalosAndK8s {
   Show-Header "[2/6] Applying Talos configs" "Yellow"
+
+  # Apply CP first, brief pause helps with transition states
   Apply-NodeConfig -ip $ControlPlaneIP -role "controlplane" -cp $ControlPlaneIP
+  Start-Sleep -Seconds 5
   foreach ($w in $WorkerIPs) { Apply-NodeConfig -ip $w -role "worker" -cp $ControlPlaneIP }
 
-  # After apply, ensure context is set (some students open a new shell; script handles it anyway)
   Set-TalosContext -cp $ControlPlaneIP
 
   Show-Header "[3/6] Bootstrapping Kubernetes control plane" "Yellow"
-  talosctl bootstrap --nodes $ControlPlaneIP --endpoints $ControlPlaneIP 2>$null | Out-Null
+  & talosctl bootstrap --nodes $ControlPlaneIP --endpoints $ControlPlaneIP 2>$null | Out-Null
 
-  # Give etcd/apiserver time to settle
   Start-Sleep -Seconds 10
 
-  # If etcd is failed, we will force rebuild by throwing
   if (Etcd-IsFailed) {
     Write-Host "Detected etcd FAILED after bootstrap. Will rebuild fresh automatically." -ForegroundColor Red
     throw "etcd_failed"
@@ -259,20 +277,15 @@ function Bootstrap-TalosAndK8s {
 
   Show-Header "[4/6] Waiting for Kubernetes API (port 6443)" "Yellow"
   $apiOk = Wait-ForPort -Ip $ControlPlaneIP -Port 6443 -TimeoutSeconds $TimeoutK8sApiSeconds -Label "Kubernetes API"
-  if (-not $apiOk) {
-    # If API never opened, rebuild
-    throw "k8s_api_down"
-  }
+  if (-not $apiOk) { throw "k8s_api_down" }
 
   Show-Header "[5/6] Fetching kubeconfig + waiting for kubectl" "Yellow"
-  talosctl kubeconfig $Kubeconfig --nodes $ControlPlaneIP --endpoints $ControlPlaneIP --force | Out-Null
+  & talosctl kubeconfig $Kubeconfig --nodes $ControlPlaneIP --endpoints $ControlPlaneIP --force | Out-Null
 
   if (-not (Test-Path $Kubeconfig)) { throw "kubeconfig was not created at: $Kubeconfig" }
 
   $kubectlOk = Wait-ForKubectl -KubeconfigPath $Kubeconfig -TimeoutSeconds $TimeoutKubectlSeconds
-  if (-not $kubectlOk) {
-    throw "kubectl_not_ready"
-  }
+  if (-not $kubectlOk) { throw "kubectl_not_ready" }
 }
 
 function Kube {
@@ -290,7 +303,6 @@ function Install-MetalLB {
 
   Kube apply -f $metallbBase | Out-Null
 
-  # Update VIP in pool YAML automatically
   $poolFile = Join-Path $metallbOverlay "metallb-pool.yaml"
   if (Test-Path $poolFile) {
     $content = Get-Content $poolFile -Raw
@@ -339,13 +351,12 @@ function Install-AppAndIngress {
 Clear-Host
 Show-Header "== CITA 360 Talos + Kubernetes Bootstrap ==" "Cyan"
 
-# Tools
 Assert-Command talosctl
 Assert-Command kubectl
 Assert-Command git
 Assert-Command helm
 
-# Prompt for IPs if user didn’t specify any parameters explicitly
+# Prompt for IPs only if user didn’t supply explicit parameters
 if ($PSBoundParameters.Count -eq 0) {
   $ClusterName    = Prompt-Default "Cluster name" $ClusterName
   $ControlPlaneIP = Prompt-Default "Control plane IP" $ControlPlaneIP
@@ -359,45 +370,47 @@ Write-Host "Workers:        $($WorkerIPs -join ', ')"
 Write-Host "VIP (MetalLB):  $VipIP"
 Write-Host ""
 
-# Ping sanity
 Assert-Reachable $ControlPlaneIP "Control Plane"
 foreach ($w in $WorkerIPs) { Assert-Reachable $w "Worker" }
 
-# If kubeconfig exists and kubectl works (and not forcing rebuild), skip rebuild
+# Fast path if kubectl works and not forcing rebuild
 $clusterOk = $false
 if (-not $ForceRebuild -and (Test-KubectlOK -KubeconfigPath $Kubeconfig)) {
   $clusterOk = $true
   Write-Host "Cluster appears healthy via kubectl. Skipping rebuild." -ForegroundColor Green
 }
 
-# If cluster not OK, rebuild automatically (wipe + rebuild)
 if (-not $clusterOk) {
   $allNodes = @($ControlPlaneIP) + $WorkerIPs
 
-  # Make sure we have a Talos context if possible (best effort). If talosconfig missing, we generate configs first.
+  # Always do a full clean rebuild in lab safe mode
   Ensure-OverridesDir
-
-  # Always start from clean generated files when rebuilding
   Clear-GeneratedFiles
 
-  # Generate configs (creates talosconfig + yaml)
+  # Generate configs, set TALOSCONFIG, then reset all nodes
   Generate-TalosConfigs
-
-  # Use talosctl reset against nodes (fresh start) BEFORE apply/bootstrap (this is what you asked for)
-  Set-TalosContext -cp $ControlPlaneIP
   Reset-Nodes -Ips $allNodes
 
-  # After reset, generate configs again (fresh secrets) and apply/bootstrap
+  # Generate fresh configs again (fresh secrets) and rebuild
   Generate-TalosConfigs
-  Bootstrap-TalosAndK8s
+
+  try {
+    Bootstrap-TalosAndK8s
+  } catch {
+    # If anything went wrong mid-build, wipe and try one more time automatically
+    Write-Host ""
+    Write-Host "Build failed. Auto-retrying one clean rebuild..." -ForegroundColor Yellow
+    Reset-Nodes -Ips $allNodes
+    Generate-TalosConfigs
+    Bootstrap-TalosAndK8s
+  }
 
   Write-Host ""
   Write-Host "Rebuild complete. kubectl is working." -ForegroundColor Green
 }
 
-# From here kubectl must work; install add-ons
 if (-not (Test-KubectlOK -KubeconfigPath $Kubeconfig)) {
-  throw "kubectl still not working after rebuild attempt. Check talosctl service/logs, but this should be rare."
+  throw "kubectl still not working after rebuild attempt."
 }
 
 Install-MetalLB
