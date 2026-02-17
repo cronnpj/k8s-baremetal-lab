@@ -10,8 +10,8 @@ Behavior:
 - Handles Talos TLS transitions automatically:
     * apply-config: tries --insecure first, then secure if TLS is required
     * if secure apply-config fails with x509/unknown authority, it force-resets that node (retrying reset with --insecure if needed)
-- Reset is also self-healing (retries with --insecure when TLS validation blocks the reset)
-- Never hard-fails early just because kubectl is down; it will rebuild.
+- Reset is self-healing (retries with --insecure when TLS validation blocks the reset).
+- IMPORTANT: Some Talos versions cannot use --wait with --insecure; reset uses --wait=false for compatibility.
 
 Defaults:
   CP  = 192.168.1.3
@@ -163,7 +163,9 @@ function Set-TalosContext {
   talosctl config node $cp | Out-Null
 }
 
-# NEW: reset a single node with automatic insecure retry if TLS validation blocks it
+# -------------------------
+# RESET (self-healing)
+# -------------------------
 function Reset-OneNode {
   param([Parameter(Mandatory=$true)][string]$Ip)
 
@@ -173,7 +175,8 @@ function Reset-OneNode {
   $ErrorActionPreference = "Continue"
   try {
     # Attempt 1 (normal)
-    $out1  = & talosctl reset --nodes $Ip --endpoints $Ip --graceful=false --reboot `
+    # NOTE: --wait=false ensures compatibility across Talos versions (some reject --insecure + --wait)
+    $out1  = & talosctl reset --wait=false --nodes $Ip --endpoints $Ip --graceful=false --reboot `
       --system-labels-to-wipe STATE --system-labels-to-wipe EPHEMERAL 2>&1
     $code1 = $LASTEXITCODE
     $txt1  = ($out1 | Out-String)
@@ -184,7 +187,7 @@ function Reset-OneNode {
     if ($txt1 -match "x509:" -or $txt1 -match "unknown authority" -or $txt1 -match "failed to verify certificate" -or $txt1 -match "tls:") {
       Write-Host "Reset needs insecure TLS on ${Ip}; retrying reset with --insecure..." -ForegroundColor Yellow
 
-      $out2  = & talosctl reset --insecure --nodes $Ip --endpoints $Ip --graceful=false --reboot `
+      $out2  = & talosctl reset --wait=false --insecure --nodes $Ip --endpoints $Ip --graceful=false --reboot `
         --system-labels-to-wipe STATE --system-labels-to-wipe EPHEMERAL 2>&1
       $code2 = $LASTEXITCODE
       $txt2  = ($out2 | Out-String)
@@ -229,6 +232,9 @@ function Reset-Nodes {
   }
 }
 
+# -------------------------
+# Talos + K8s build
+# -------------------------
 function Generate-TalosConfigs {
   Ensure-OverridesDir
   Clear-GeneratedFiles
@@ -260,7 +266,6 @@ function Apply-NodeConfig {
 
   Write-Host "Applying ${role} config to ${ip} ..." -ForegroundColor Gray
 
-  # IMPORTANT: never allow the first (insecure) native error to terminate the function
   $prevEap = $ErrorActionPreference
   $ErrorActionPreference = "Continue"
   try {
@@ -271,7 +276,7 @@ function Apply-NodeConfig {
 
     if ($code1 -eq 0) { return }
 
-    # If TLS required -> retry secure (uses $env:TALOSCONFIG)
+    # If TLS required -> retry secure
     if ($txt1 -match "tls:\s*certificate required" -or $txt1 -match "certificate required") {
       Write-Host "TLS required on ${ip}; retrying apply-config securely..." -ForegroundColor Yellow
 
@@ -281,19 +286,15 @@ function Apply-NodeConfig {
 
       if ($code2 -eq 0) { return }
 
-      # NEW: secure retry failed due to x509 mismatch => node wasn't wiped (old secrets)
+      # If secure retry failed due to x509 mismatch => force reset and retry
       if ($txt2 -match "x509:" -or $txt2 -match "unknown authority" -or $txt2 -match "failed to verify certificate") {
         Write-Host "Secure apply-config failed due to certificate mismatch (old node state). Forcing reset of ${ip} and retrying..." -ForegroundColor Yellow
 
         $r = Reset-OneNode -Ip $ip
-        if (-not $r) {
-          throw "apply-config failed for ${ip}: node reset also failed. Output:`n$txt2"
-        }
+        if (-not $r) { throw "apply-config failed for ${ip}: node reset also failed. Output:`n$txt2" }
 
         $back = Wait-ForPort -Ip $ip -Port 50000 -TimeoutSeconds $TimeoutTalosApiSeconds -Label "Talos API (node ${ip})"
-        if (-not $back) {
-          throw "Node ${ip} did not come back on Talos API after reset."
-        }
+        if (-not $back) { throw "Node ${ip} did not come back on Talos API after reset." }
 
         $out3  = & talosctl apply-config --insecure --nodes $ip --endpoints $cp --file $file 2>&1
         $code3 = $LASTEXITCODE
@@ -334,10 +335,8 @@ function Etcd-IsFailed {
 function Bootstrap-TalosAndK8s {
   Show-Header "[2/6] Applying Talos configs" "Yellow"
 
-  # Ensure TALOSCONFIG/context is set before any secure retries can occur
   Set-TalosContext -cp $ControlPlaneIP
 
-  # Apply CP first, brief pause helps with transition states
   Apply-NodeConfig -ip $ControlPlaneIP -role "controlplane" -cp $ControlPlaneIP
   Start-Sleep -Seconds 5
   foreach ($w in $WorkerIPs) { Apply-NodeConfig -ip $w -role "worker" -cp $ControlPlaneIP }
@@ -462,11 +461,10 @@ if (-not $ForceRebuild -and (Test-KubectlOK -KubeconfigPath $Kubeconfig)) {
 if (-not $clusterOk) {
   $allNodes = @($ControlPlaneIP) + $WorkerIPs
 
-  # Full clean rebuild in lab safe mode
   Ensure-OverridesDir
   Clear-GeneratedFiles
 
-  # Generate configs, set TALOSCONFIG, then reset all nodes (reset is now self-healing)
+  # Generate configs, set TALOSCONFIG, then reset all nodes
   Generate-TalosConfigs
   Reset-Nodes -Ips $allNodes
 
@@ -476,7 +474,6 @@ if (-not $clusterOk) {
   try {
     Bootstrap-TalosAndK8s
   } catch {
-    # If anything went wrong mid-build, wipe and try one more time automatically
     Write-Host ""
     Write-Host "Build failed. Auto-retrying one clean rebuild..." -ForegroundColor Yellow
     Reset-Nodes -Ips $allNodes
