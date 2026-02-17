@@ -5,6 +5,7 @@ Run this on the Talos CTL VM (inside the isolated lab network).
 
 Behavior:
 - Prompts for IPs (defaults provided).
+- Auto-updates the repo with `git pull` (unless -SkipRepoUpdate).
 - If cluster is healthy via kubectl: installs MetalLB + ingress-nginx + sample app.
 - If cluster is NOT healthy: automatically wipes (reset) ALL nodes and rebuilds Talos + Kubernetes, then installs.
 - Handles Talos TLS transitions automatically:
@@ -12,6 +13,7 @@ Behavior:
     * if secure apply-config fails with x509/unknown authority, it force-resets that node (retrying reset with --insecure if needed)
 - Reset is self-healing (retries with --insecure when TLS validation blocks the reset).
 - IMPORTANT: Some Talos versions cannot use --wait with --insecure; reset uses --wait=false for compatibility.
+- Writes a detailed log to bootstrap.log for easy copy/paste troubleshooting.
 
 Defaults:
   CP  = 192.168.1.3
@@ -23,6 +25,7 @@ Usage:
   .\bootstrap.ps1
   .\bootstrap.ps1 -ControlPlaneIP 192.168.1.13 -WorkerIPs 192.168.1.15,192.168.1.16 -VipIP 192.168.1.210
   .\bootstrap.ps1 -ForceRebuild
+  .\bootstrap.ps1 -SkipRepoUpdate
 #>
 
 [CmdletBinding()]
@@ -38,7 +41,10 @@ param(
   [int]$TimeoutKubectlSeconds  = 420,  # kubectl get nodes after kubeconfig
 
   # If set, always wipes and rebuilds even if kubectl works
-  [switch]$ForceRebuild
+  [switch]$ForceRebuild,
+
+  # If set, skip the automatic `git pull`
+  [switch]$SkipRepoUpdate
 )
 
 $ErrorActionPreference = "Stop"
@@ -52,16 +58,52 @@ $OverridesDir = Join-Path $TalosDir  "student-overrides"
 $TalosConfig  = Join-Path $OverridesDir "talosconfig"
 $Kubeconfig   = Join-Path $RepoRoot "kubeconfig"
 
+# Logging
+$LogFile = Join-Path $RepoRoot "bootstrap.log"
+$ExpectedRepoRoot = "C:\CITA_StudentRepos\k8s-baremetal-lab"
+
 # -------------------------
-# Helpers
+# Logging + UI
 # -------------------------
+function Log-Line {
+  param([string]$Message)
+  try {
+    $ts = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+    Add-Content -Path $LogFile -Value "[$ts] $Message"
+  } catch { }
+}
+
 function Show-Header {
   param([string]$Title,[string]$Color="Cyan")
   Write-Host ""
   Write-Host $Title -ForegroundColor $Color
   Write-Host ""
+  Log-Line $Title
 }
 
+function Show-Warn {
+  param([string]$Message)
+  Write-Host $Message -ForegroundColor DarkYellow
+  Log-Line "WARN: $Message"
+}
+
+function Show-Err {
+  param([string]$Message)
+  Write-Host $Message -ForegroundColor Red
+  Log-Line "ERROR: $Message"
+}
+
+# Start log fresh each run (keep last run only)
+try {
+  Set-Content -Path $LogFile -Value ("==== bootstrap run: {0} ====" -f (Get-Date)) -Encoding utf8
+} catch {}
+
+Log-Line "RepoRoot: $RepoRoot"
+Log-Line "ExpectedRepoRoot: $ExpectedRepoRoot"
+
+# -------------------------
+# Input Helpers
+# -------------------------
 function Prompt-Default($prompt,$default) {
   $v = Read-Host "$prompt [$default]"
   if ([string]::IsNullOrWhiteSpace($v)) { return $default }
@@ -84,6 +126,9 @@ function Prompt-WorkerIPs($defaults) {
   return $ips
 }
 
+# -------------------------
+# Preconditions
+# -------------------------
 function Assert-Command($name) {
   if (-not (Get-Command $name -ErrorAction SilentlyContinue)) {
     throw "Missing required command '${name}'. Install it first (talosctl / kubectl / git / helm)."
@@ -115,7 +160,7 @@ function Wait-ForPort {
   while ($true) {
     if (Test-TcpPort -Ip $Ip -Port $Port) { return $true }
     if (((Get-Date)-$start).TotalSeconds -ge $TimeoutSeconds) {
-      Write-Host "${Label} still not reachable: ${Ip}:${Port}" -ForegroundColor Red
+      Show-Err ("{0} still not reachable: {1}:{2}" -f $Label,$Ip,$Port)
       return $false
     }
     Start-Sleep -Seconds 5
@@ -141,12 +186,49 @@ function Wait-ForKubectl {
   }
 }
 
+# -------------------------
+# Repo update
+# -------------------------
+function Ensure-RepoLocationAndUpdate {
+  if ($RepoRoot -ne $ExpectedRepoRoot) {
+    Show-Warn "Repo is running from: $RepoRoot"
+    Show-Warn "Recommended lab path: $ExpectedRepoRoot"
+    Show-Warn "This is not fatal, but student instructions should standardize the path."
+  }
+
+  if ($SkipRepoUpdate) {
+    Log-Line "SkipRepoUpdate enabled; not running git pull."
+    return
+  }
+
+  $gitDir = Join-Path $RepoRoot ".git"
+  if (-not (Test-Path $gitDir)) {
+    Show-Warn "No .git folder found; skipping git pull. (This may be a copied folder instead of a cloned repo.)"
+    return
+  }
+
+  Show-Header "Repo update: git pull" "Yellow"
+  try {
+    $out = & git -C $RepoRoot pull 2>&1
+    $txt = ($out | Out-String).Trim()
+    if ($txt) {
+      Write-Host $txt -ForegroundColor Gray
+      Log-Line ("git pull: " + $txt.Replace("`r`n"," | "))
+    }
+  } catch {
+    Show-Warn "git pull failed (continuing). If the lab network blocks GitHub, this is expected."
+    Log-Line ("git pull exception: " + $_.Exception.Message)
+  }
+}
+
+# -------------------------
+# Files
+# -------------------------
 function Ensure-OverridesDir {
   New-Item -ItemType Directory -Force -Path $OverridesDir | Out-Null
 }
 
 function Clear-GeneratedFiles {
-  # Delete kubeconfig + generated talos files so we don't reuse stale state
   Remove-Item -Force -ErrorAction SilentlyContinue $Kubeconfig
   Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $OverridesDir "controlplane.yaml")
   Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $OverridesDir "worker.yaml")
@@ -161,6 +243,7 @@ function Set-TalosContext {
   $env:TALOSCONFIG = $TalosConfig
   talosctl config endpoint $cp | Out-Null
   talosctl config node $cp | Out-Null
+  Log-Line "Talos context set: endpoint/node = $cp"
 }
 
 # -------------------------
@@ -170,27 +253,32 @@ function Reset-OneNode {
   param([Parameter(Mandatory=$true)][string]$Ip)
 
   Write-Host "Resetting ${Ip} ..." -ForegroundColor Gray
+  Log-Line "Reset-OneNode start: $Ip"
 
   $prevEap = $ErrorActionPreference
   $ErrorActionPreference = "Continue"
   try {
-    # Attempt 1 (normal)
-    # NOTE: --wait=false ensures compatibility across Talos versions (some reject --insecure + --wait)
     $out1  = & talosctl reset --wait=false --nodes $Ip --endpoints $Ip --graceful=false --reboot `
       --system-labels-to-wipe STATE --system-labels-to-wipe EPHEMERAL 2>&1
     $code1 = $LASTEXITCODE
     $txt1  = ($out1 | Out-String)
 
+    Log-Line ("Reset-OneNode normal exitcode=$code1 for $Ip")
+    if ($txt1.Trim()) { Log-Line ("Reset-OneNode normal output for ${ip}: " + $txt1.Replace("`r`n"," | ").Trim()) }
+
     if ($code1 -eq 0) { return $true }
 
-    # If TLS verification/auth is blocking reset, retry insecure
     if ($txt1 -match "x509:" -or $txt1 -match "unknown authority" -or $txt1 -match "failed to verify certificate" -or $txt1 -match "tls:") {
       Write-Host "Reset needs insecure TLS on ${Ip}; retrying reset with --insecure..." -ForegroundColor Yellow
+      Log-Line "Reset-OneNode insecure retry: $Ip"
 
       $out2  = & talosctl reset --wait=false --insecure --nodes $Ip --endpoints $Ip --graceful=false --reboot `
         --system-labels-to-wipe STATE --system-labels-to-wipe EPHEMERAL 2>&1
       $code2 = $LASTEXITCODE
       $txt2  = ($out2 | Out-String)
+
+      Log-Line ("Reset-OneNode insecure exitcode=$code2 for $Ip")
+      if ($txt2.Trim()) { Log-Line ("Reset-OneNode insecure output for ${ip}: " + $txt2.Replace("`r`n"," | ").Trim()) }
 
       if ($code2 -eq 0) { return $true }
 
@@ -228,7 +316,7 @@ function Reset-Nodes {
 
   if ($anyFailed) {
     Write-Host ""
-    Write-Host "Warning: One or more resets reported failure. Rebuild will continue, but if apply-config still complains about TLS/x509, a node likely didn't wipe." -ForegroundColor DarkYellow
+    Show-Warn "Warning: One or more resets reported failure. Rebuild will continue, but if apply-config still complains about TLS/x509, a node likely didn't wipe."
   }
 }
 
@@ -241,6 +329,9 @@ function Generate-TalosConfigs {
 
   Show-Header "[1/6] Generating Talos configs" "Yellow"
   & talosctl gen config $ClusterName "https://${ControlPlaneIP}:6443" --output-dir $OverridesDir | Out-Null
+
+  # FIXED: use ${ControlPlaneIP} before :6443 in log text
+  Log-Line "Generated Talos configs: cluster=$ClusterName endpoint=https://${ControlPlaneIP}:6443 output=$OverridesDir"
 
   if (-not (Test-Path (Join-Path $OverridesDir "controlplane.yaml"))) { throw "controlplane.yaml was not generated." }
   if (-not (Test-Path (Join-Path $OverridesDir "worker.yaml")))      { throw "worker.yaml was not generated." }
@@ -265,40 +356,71 @@ function Apply-NodeConfig {
   if (-not (Test-Path $file)) { throw "Missing ${role} config file: $file" }
 
   Write-Host "Applying ${role} config to ${ip} ..." -ForegroundColor Gray
+  Log-Line "Apply-NodeConfig start: ip=$ip role=$role cp=$cp file=$file"
 
   $prevEap = $ErrorActionPreference
   $ErrorActionPreference = "Continue"
   try {
-    # Attempt 1: insecure (fresh/reset nodes)
     $out1  = & talosctl apply-config --insecure --nodes $ip --endpoints $cp --file $file 2>&1
     $code1 = $LASTEXITCODE
     $txt1  = ($out1 | Out-String)
 
+    Log-Line ("apply-config insecure exitcode=$code1 for $ip")
+    if ($txt1.Trim()) { Log-Line ("apply-config insecure output for ${ip}: " + $txt1.Replace("`r`n"," | ").Trim()) }
+
     if ($code1 -eq 0) { return }
 
-    # If TLS required -> retry secure
     if ($txt1 -match "tls:\s*certificate required" -or $txt1 -match "certificate required") {
       Write-Host "TLS required on ${ip}; retrying apply-config securely..." -ForegroundColor Yellow
+      Log-Line "apply-config secure retry: $ip"
 
       $out2  = & talosctl apply-config --nodes $ip --endpoints $cp --file $file 2>&1
       $code2 = $LASTEXITCODE
       $txt2  = ($out2 | Out-String)
 
+      Log-Line ("apply-config secure exitcode=$code2 for $ip")
+      if ($txt2.Trim()) { Log-Line ("apply-config secure output for ${ip}: " + $txt2.Replace("`r`n"," | ").Trim()) }
+
       if ($code2 -eq 0) { return }
 
-      # If secure retry failed due to x509 mismatch => force reset and retry
       if ($txt2 -match "x509:" -or $txt2 -match "unknown authority" -or $txt2 -match "failed to verify certificate") {
         Write-Host "Secure apply-config failed due to certificate mismatch (old node state). Forcing reset of ${ip} and retrying..." -ForegroundColor Yellow
+        Log-Line "Certificate mismatch detected on $ip; attempting forced reset."
 
         $r = Reset-OneNode -Ip $ip
-        if (-not $r) { throw "apply-config failed for ${ip}: node reset also failed. Output:`n$txt2" }
+        if (-not $r) {
+          $msg = @"
+apply-config failed for ${ip} due to certificate mismatch AND the node reset also failed.
+
+LAB FIX (fastest + most reliable):
+1) In Proxmox, delete and recreate the Talos node VMs (Control Plane + Workers)
+2) Boot them with the same IPs
+3) Rerun:
+   .\bootstrap.ps1 -ForceRebuild
+
+Troubleshooting log:
+- See: $LogFile
+
+Details from secure apply-config:
+$txt2
+"@
+          Log-Line "LAB NUKE triggered for $ip (reset failed after cert mismatch)."
+          throw $msg
+        }
 
         $back = Wait-ForPort -Ip $ip -Port 50000 -TimeoutSeconds $TimeoutTalosApiSeconds -Label "Talos API (node ${ip})"
-        if (-not $back) { throw "Node ${ip} did not come back on Talos API after reset." }
+        if (-not $back) {
+          $msg = "Node ${ip} did not come back on Talos API after reset. LAB FIX: rebuild Talos VMs in Proxmox, then rerun bootstrap."
+          Log-Line $msg
+          throw $msg
+        }
 
         $out3  = & talosctl apply-config --insecure --nodes $ip --endpoints $cp --file $file 2>&1
         $code3 = $LASTEXITCODE
         $txt3  = ($out3 | Out-String)
+
+        Log-Line ("apply-config post-reset insecure exitcode=$code3 for $ip")
+        if ($txt3.Trim()) { Log-Line ("apply-config post-reset insecure output for ${ip}: " + $txt3.Replace("`r`n"," | ").Trim()) }
 
         if ($code3 -eq 0) { return }
 
@@ -345,11 +467,12 @@ function Bootstrap-TalosAndK8s {
 
   Show-Header "[3/6] Bootstrapping Kubernetes control plane" "Yellow"
   & talosctl bootstrap --nodes $ControlPlaneIP --endpoints $ControlPlaneIP 2>$null | Out-Null
+  Log-Line "talosctl bootstrap issued to ${ControlPlaneIP}"
 
   Start-Sleep -Seconds 10
 
   if (Etcd-IsFailed) {
-    Write-Host "Detected etcd FAILED after bootstrap. Will rebuild fresh automatically." -ForegroundColor Red
+    Show-Err "Detected etcd FAILED after bootstrap. Will rebuild fresh automatically."
     throw "etcd_failed"
   }
 
@@ -359,6 +482,7 @@ function Bootstrap-TalosAndK8s {
 
   Show-Header "[5/6] Fetching kubeconfig + waiting for kubectl" "Yellow"
   & talosctl kubeconfig $Kubeconfig --nodes $ControlPlaneIP --endpoints $ControlPlaneIP --force | Out-Null
+  Log-Line "kubeconfig written to $Kubeconfig"
 
   if (-not (Test-Path $Kubeconfig)) { throw "kubeconfig was not created at: $Kubeconfig" }
 
@@ -390,6 +514,7 @@ function Install-MetalLB {
       "    - $VipIP/32"
     )
     Set-Content -Path $poolFile -Value $content -Encoding utf8
+    Log-Line "Updated MetalLB VIP in $poolFile to $VipIP/32"
   }
 
   Kube apply -f $metallbOverlay | Out-Null
@@ -434,6 +559,8 @@ Assert-Command kubectl
 Assert-Command git
 Assert-Command helm
 
+Ensure-RepoLocationAndUpdate
+
 # Prompt for IPs only if user didn’t supply explicit parameters
 if ($PSBoundParameters.Count -eq 0) {
   $ClusterName    = Prompt-Default "Cluster name" $ClusterName
@@ -446,16 +573,19 @@ Write-Host "ClusterName:    $ClusterName"
 Write-Host "ControlPlaneIP: $ControlPlaneIP"
 Write-Host "Workers:        $($WorkerIPs -join ', ')"
 Write-Host "VIP (MetalLB):  $VipIP"
+Write-Host "Log file:       $LogFile"
 Write-Host ""
+
+Log-Line "Inputs: ClusterName=$ClusterName ControlPlaneIP=$ControlPlaneIP Workers=$($WorkerIPs -join ',') VipIP=$VipIP ForceRebuild=$ForceRebuild"
 
 Assert-Reachable $ControlPlaneIP "Control Plane"
 foreach ($w in $WorkerIPs) { Assert-Reachable $w "Worker" }
 
-# Fast path if kubectl works and not forcing rebuild
 $clusterOk = $false
 if (-not $ForceRebuild -and (Test-KubectlOK -KubeconfigPath $Kubeconfig)) {
   $clusterOk = $true
   Write-Host "Cluster appears healthy via kubectl. Skipping rebuild." -ForegroundColor Green
+  Log-Line "kubectl healthy; skipping rebuild."
 }
 
 if (-not $clusterOk) {
@@ -464,18 +594,18 @@ if (-not $clusterOk) {
   Ensure-OverridesDir
   Clear-GeneratedFiles
 
-  # Generate configs, set TALOSCONFIG, then reset all nodes
   Generate-TalosConfigs
   Reset-Nodes -Ips $allNodes
 
-  # Generate fresh configs again (fresh secrets) and rebuild
   Generate-TalosConfigs
 
   try {
     Bootstrap-TalosAndK8s
   } catch {
     Write-Host ""
-    Write-Host "Build failed. Auto-retrying one clean rebuild..." -ForegroundColor Yellow
+    Show-Warn "Build failed. Auto-retrying one clean rebuild..."
+    Log-Line ("Bootstrap attempt failed: " + $_.Exception.Message.Replace("`r`n"," | "))
+
     Reset-Nodes -Ips $allNodes
     Generate-TalosConfigs
     Bootstrap-TalosAndK8s
@@ -483,10 +613,13 @@ if (-not $clusterOk) {
 
   Write-Host ""
   Write-Host "Rebuild complete. kubectl is working." -ForegroundColor Green
+  Log-Line "Rebuild complete; kubectl is working."
 }
 
 if (-not (Test-KubectlOK -KubeconfigPath $Kubeconfig)) {
-  throw "kubectl still not working after rebuild attempt."
+  $msg = "kubectl still not working after rebuild attempt. See log: $LogFile"
+  Log-Line $msg
+  throw $msg
 }
 
 Install-MetalLB
@@ -503,3 +636,4 @@ Kube get ingress
 Write-Host ""
 Write-Host "Done." -ForegroundColor Green
 Write-Host "Test URL (inside lab network): http://$VipIP"
+Log-Line "DONE"
