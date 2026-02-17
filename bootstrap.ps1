@@ -7,7 +7,10 @@ Behavior:
 - Prompts for IPs (defaults provided).
 - If cluster is healthy via kubectl: installs MetalLB + ingress-nginx + sample app.
 - If cluster is NOT healthy: automatically wipes (reset) ALL nodes and rebuilds Talos + Kubernetes, then installs.
-- Handles Talos "tls: certificate required" automatically by retrying apply-config securely.
+- Handles Talos TLS transitions automatically:
+    * apply-config: tries --insecure first, then secure if TLS is required
+    * if secure apply-config fails with x509/unknown authority, it force-resets that node (retrying reset with --insecure if needed)
+- Reset is also self-healing (retries with --insecure when TLS validation blocks the reset)
 - Never hard-fails early just because kubectl is down; it will rebuild.
 
 Defaults:
@@ -160,6 +163,86 @@ function Set-TalosContext {
   talosctl config node $cp | Out-Null
 }
 
+# NEW: reset a single node with automatic insecure retry if TLS validation blocks it
+function Reset-OneNode {
+  param([Parameter(Mandatory=$true)][string]$Ip)
+
+  Write-Host "Resetting ${Ip} ..." -ForegroundColor Gray
+
+  $prevEap = $ErrorActionPreference
+  $ErrorActionPreference = "Continue"
+  try {
+    # Attempt 1 (normal)
+    $out1  = & talosctl reset --nodes $Ip --endpoints $Ip --graceful=false --reboot `
+      --system-labels-to-wipe STATE --system-labels-to-wipe EPHEMERAL 2>&1
+    $code1 = $LASTEXITCODE
+    $txt1  = ($out1 | Out-String)
+
+    if ($code1 -eq 0) { return $true }
+
+    # If TLS verification/auth is blocking reset, retry insecure
+    if ($txt1 -match "x509:" -or $txt1 -match "unknown authority" -or $txt1 -match "failed to verify certificate" -or $txt1 -match "tls:") {
+      Write-Host "Reset needs insecure TLS on ${Ip}; retrying reset with --insecure..." -ForegroundColor Yellow
+
+      $out2  = & talosctl reset --insecure --nodes $Ip --endpoints $Ip --graceful=false --reboot `
+        --system-labels-to-wipe STATE --system-labels-to-wipe EPHEMERAL 2>&1
+      $code2 = $LASTEXITCODE
+      $txt2  = ($out2 | Out-String)
+
+      if ($code2 -eq 0) { return $true }
+
+      Write-Host "Reset failed on ${Ip} even with --insecure:`n$txt2" -ForegroundColor DarkYellow
+      return $false
+    }
+
+    Write-Host "Reset failed on ${Ip}:`n$txt1" -ForegroundColor DarkYellow
+    return $false
+  }
+  finally {
+    $ErrorActionPreference = $prevEap
+  }
+}
+
+function Reset-Nodes {
+  param([string[]]$Ips)
+
+  Show-Header "RESET: Wiping Talos STATE + EPHEMERAL on all nodes (fresh start)" "Yellow"
+  Write-Host ("Nodes: {0}" -f ($Ips -join ", ")) -ForegroundColor Yellow
+  Write-Host "Lab safe mode: if anything breaks, this rebuilds from scratch." -ForegroundColor DarkGray
+
+  $anyFailed = $false
+  foreach ($ip in $Ips) {
+    $ok = Reset-OneNode -Ip $ip
+    if (-not $ok) { $anyFailed = $true }
+  }
+
+  Write-Host ""
+  Write-Host "Waiting for Talos API (port 50000) on control plane..." -ForegroundColor Yellow
+  $okApi = Wait-ForPort -Ip $ControlPlaneIP -Port 50000 -TimeoutSeconds $TimeoutTalosApiSeconds -Label "Talos API"
+  if (-not $okApi) {
+    throw "Talos API did not come back on ${ControlPlaneIP}:50000 in time."
+  }
+
+  if ($anyFailed) {
+    Write-Host ""
+    Write-Host "Warning: One or more resets reported failure. Rebuild will continue, but if apply-config still complains about TLS/x509, a node likely didn't wipe." -ForegroundColor DarkYellow
+  }
+}
+
+function Generate-TalosConfigs {
+  Ensure-OverridesDir
+  Clear-GeneratedFiles
+
+  Show-Header "[1/6] Generating Talos configs" "Yellow"
+  & talosctl gen config $ClusterName "https://${ControlPlaneIP}:6443" --output-dir $OverridesDir | Out-Null
+
+  if (-not (Test-Path (Join-Path $OverridesDir "controlplane.yaml"))) { throw "controlplane.yaml was not generated." }
+  if (-not (Test-Path (Join-Path $OverridesDir "worker.yaml")))      { throw "worker.yaml was not generated." }
+  if (-not (Test-Path $TalosConfig))                                 { throw "talosconfig was not generated." }
+
+  Set-TalosContext -cp $ControlPlaneIP
+}
+
 function Apply-NodeConfig {
   param(
     [Parameter(Mandatory=$true)][string]$ip,
@@ -198,6 +281,29 @@ function Apply-NodeConfig {
 
       if ($code2 -eq 0) { return }
 
+      # NEW: secure retry failed due to x509 mismatch => node wasn't wiped (old secrets)
+      if ($txt2 -match "x509:" -or $txt2 -match "unknown authority" -or $txt2 -match "failed to verify certificate") {
+        Write-Host "Secure apply-config failed due to certificate mismatch (old node state). Forcing reset of ${ip} and retrying..." -ForegroundColor Yellow
+
+        $r = Reset-OneNode -Ip $ip
+        if (-not $r) {
+          throw "apply-config failed for ${ip}: node reset also failed. Output:`n$txt2"
+        }
+
+        $back = Wait-ForPort -Ip $ip -Port 50000 -TimeoutSeconds $TimeoutTalosApiSeconds -Label "Talos API (node ${ip})"
+        if (-not $back) {
+          throw "Node ${ip} did not come back on Talos API after reset."
+        }
+
+        $out3  = & talosctl apply-config --insecure --nodes $ip --endpoints $cp --file $file 2>&1
+        $code3 = $LASTEXITCODE
+        $txt3  = ($out3 | Out-String)
+
+        if ($code3 -eq 0) { return }
+
+        throw "apply-config still failed for ${ip} after forced reset:`n$txt3"
+      }
+
       throw "apply-config failed for ${ip} (secure retry also failed):`n$txt2"
     }
 
@@ -223,45 +329,6 @@ function Etcd-IsFailed {
   $line = Get-EtcdServiceLine
   if (-not $line) { return $false }
   return ($line -match "\betcd\b" -and $line -match "\bFailed\b")
-}
-
-function Reset-Nodes {
-  param([string[]]$Ips)
-
-  Show-Header "RESET: Wiping Talos STATE + EPHEMERAL on all nodes (fresh start)" "Yellow"
-  Write-Host ("Nodes: {0}" -f ($Ips -join ", ")) -ForegroundColor Yellow
-  Write-Host "Lab safe mode: if anything breaks, this rebuilds from scratch." -ForegroundColor DarkGray
-
-  foreach ($ip in $Ips) {
-    try {
-      Write-Host "Resetting ${ip} ..." -ForegroundColor Gray
-      & talosctl reset --nodes $ip --graceful=false --reboot `
-        --system-labels-to-wipe STATE --system-labels-to-wipe EPHEMERAL 2>$null | Out-Null
-    } catch {
-      Write-Host "Reset command failed on ${ip} (continuing). It may already be rebooting." -ForegroundColor DarkGray
-    }
-  }
-
-  Write-Host ""
-  Write-Host "Waiting for Talos API (port 50000) on control plane..." -ForegroundColor Yellow
-  $ok = Wait-ForPort -Ip $ControlPlaneIP -Port 50000 -TimeoutSeconds $TimeoutTalosApiSeconds -Label "Talos API"
-  if (-not $ok) {
-    throw "Talos API did not come back on ${ControlPlaneIP}:50000 in time."
-  }
-}
-
-function Generate-TalosConfigs {
-  Ensure-OverridesDir
-  Clear-GeneratedFiles
-
-  Show-Header "[1/6] Generating Talos configs" "Yellow"
-  & talosctl gen config $ClusterName "https://${ControlPlaneIP}:6443" --output-dir $OverridesDir | Out-Null
-
-  if (-not (Test-Path (Join-Path $OverridesDir "controlplane.yaml"))) { throw "controlplane.yaml was not generated." }
-  if (-not (Test-Path (Join-Path $OverridesDir "worker.yaml")))      { throw "worker.yaml was not generated." }
-  if (-not (Test-Path $TalosConfig))                                 { throw "talosconfig was not generated." }
-
-  Set-TalosContext -cp $ControlPlaneIP
 }
 
 function Bootstrap-TalosAndK8s {
@@ -399,7 +466,7 @@ if (-not $clusterOk) {
   Ensure-OverridesDir
   Clear-GeneratedFiles
 
-  # Generate configs, set TALOSCONFIG, then reset all nodes
+  # Generate configs, set TALOSCONFIG, then reset all nodes (reset is now self-healing)
   Generate-TalosConfigs
   Reset-Nodes -Ips $allNodes
 
