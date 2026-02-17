@@ -10,16 +10,25 @@ Defaults:
 
 Examples:
   .\bootstrap.ps1
-  .\bootstrap.ps1 -ControlPlaneIP 192.168.1.13 -Worker1IP 192.168.1.16 -Worker2IP 192.168.1.17 -VipIP 192.168.1.210
+  .\bootstrap.ps1 -ControlPlaneIP 192.168.1.13 -WorkerIPs 192.168.1.16,192.168.1.17 -VipIP 192.168.1.210
   .\bootstrap.ps1 -TalosOnly
+
+Legacy examples still work:
+  .\bootstrap.ps1 -ControlPlaneIP 192.168.1.13 -Worker1IP 192.168.1.16 -Worker2IP 192.168.1.17 -VipIP 192.168.1.210
 #>
 
 [CmdletBinding()]
 param(
   [string]$ClusterName    = "cita360",
   [string]$ControlPlaneIP = "192.168.1.3",
+
+  # New preferred way: any number of workers
+  [string[]]$WorkerIPs    = @(),
+
+  # Legacy (kept for compatibility)
   [string]$Worker1IP      = "192.168.1.6",
   [string]$Worker2IP      = "192.168.1.7",
+
   [string]$VipIP          = "192.168.1.200",
 
   # If you want to stop after Talos bootstrap + kubeconfig, use -TalosOnly
@@ -28,6 +37,9 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# -------------------------
+# Helpers
+# -------------------------
 function Assert-Command($name) {
   if (-not (Get-Command $name -ErrorAction SilentlyContinue)) {
     throw "Missing required command '$name'. Install it first (talosctl / kubectl / git / helm)."
@@ -37,6 +49,81 @@ function Assert-Command($name) {
 function Assert-Reachable($ip, $label) {
   $ok = Test-Connection -ComputerName $ip -Count 1 -Quiet
   if (-not $ok) { throw "$label ($ip) is not reachable. Check IP/subnet/VM power state." }
+}
+
+function Assert-IPv4($ip, $label) {
+  $ipObj = $null
+  if (-not ([System.Net.IPAddress]::TryParse($ip, [ref]$ipObj) -and $ipObj.AddressFamily -eq 'InterNetwork')) {
+    throw "$label '$ip' is not a valid IPv4 address."
+  }
+}
+
+function Read-Default {
+  param(
+    [Parameter(Mandatory=$true)][string]$Prompt,
+    [string]$Default = ""
+  )
+  $suffix = if ($Default) { " [$Default]" } else { "" }
+  $v = Read-Host "$Prompt$suffix"
+  if ([string]::IsNullOrWhiteSpace($v)) { return $Default }
+  return $v.Trim()
+}
+
+function Read-IPv4Prompt {
+  param(
+    [Parameter(Mandatory=$true)][string]$Prompt,
+    [Parameter(Mandatory=$true)][string]$Default
+  )
+  while ($true) {
+    $v = Read-Default -Prompt $Prompt -Default $Default
+    $ipObj = $null
+    if ([System.Net.IPAddress]::TryParse($v, [ref]$ipObj) -and $ipObj.AddressFamily -eq 'InterNetwork') {
+      return $v
+    }
+    Write-Host "Invalid IPv4 address. Try again." -ForegroundColor Yellow
+  }
+}
+
+function Read-IPv4ListPrompt {
+  param(
+    [Parameter(Mandatory=$true)][string]$Prompt,
+    [string[]]$Defaults = @()
+  )
+
+  Write-Host ""
+  Write-Host $Prompt -ForegroundColor Cyan
+  Write-Host "Enter one IP per line. Press Enter on a blank line to finish." -ForegroundColor DarkGray
+  if ($Defaults.Count -gt 0) {
+    Write-Host ("Default workers: {0}" -f ($Defaults -join ", ")) -ForegroundColor DarkGray
+    Write-Host "Tip: Press Enter immediately to accept defaults." -ForegroundColor DarkGray
+  }
+
+  $items = @()
+
+  $first = Read-Host "Worker IP (blank to finish)"
+  if ([string]::IsNullOrWhiteSpace($first)) {
+    if ($Defaults.Count -gt 0) { return $Defaults }
+    Write-Host "Please enter at least one worker IP." -ForegroundColor Yellow
+  } else {
+    $items += $first.Trim()
+  }
+
+  while ($true) {
+    $v = Read-Host "Worker IP (blank to finish)"
+    if ([string]::IsNullOrWhiteSpace($v)) { break }
+    $items += $v.Trim()
+  }
+
+  $out = @()
+  foreach ($ip in $items) {
+    $ipObj = $null
+    if (-not ([System.Net.IPAddress]::TryParse($ip, [ref]$ipObj) -and $ipObj.AddressFamily -eq 'InterNetwork')) {
+      Write-Host "Invalid IPv4 in list: $ip" -ForegroundColor Yellow
+      return (Read-IPv4ListPrompt -Prompt $Prompt -Defaults $Defaults)
+    }
+    $out += $ip
+  }
+  return $out
 }
 
 function Invoke-Kube {
@@ -66,11 +153,59 @@ function Wait-ForIngressExternalIP {
   }
 }
 
+# -------------------------
+# Decide whether to prompt
+# -------------------------
+
+# If WorkerIPs not provided, build it from legacy params (defaults or overrides)
+if (-not $WorkerIPs -or $WorkerIPs.Count -eq 0) {
+  $WorkerIPs = @($Worker1IP, $Worker2IP) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+}
+
+# Determine if user explicitly passed any parameters (non-interactive intent)
+$boundKeys = @($PSBoundParameters.Keys)
+
+$ranWithExplicitValues =
+  $boundKeys.Contains("ClusterName") -or
+  $boundKeys.Contains("ControlPlaneIP") -or
+  $boundKeys.Contains("WorkerIPs") -or
+  $boundKeys.Contains("Worker1IP") -or
+  $boundKeys.Contains("Worker2IP") -or
+  $boundKeys.Contains("VipIP")
+
+if (-not $ranWithExplicitValues) {
+  Clear-Host
+  Write-Host "== CITA 360 Talos + Kubernetes Bootstrap ==" -ForegroundColor Cyan
+  Write-Host ""
+
+  $defaultWorkers = @("192.168.1.6", "192.168.1.7")
+
+  $ClusterName    = Read-Default     -Prompt "Cluster name"       -Default $ClusterName
+  $ControlPlaneIP = Read-IPv4Prompt  -Prompt "Control Plane IP"   -Default $ControlPlaneIP
+  $WorkerIPs      = Read-IPv4ListPrompt -Prompt "Worker node IPs" -Defaults $defaultWorkers
+  $VipIP          = Read-IPv4Prompt  -Prompt "VIP (MetalLB) IP"   -Default $VipIP
+
+  Write-Host ""
+  Write-Host "Using configuration:" -ForegroundColor Green
+  Write-Host ("ClusterName:      {0}" -f $ClusterName)
+  Write-Host ("ControlPlaneIP:   {0}" -f $ControlPlaneIP)
+  Write-Host ("WorkerIPs:        {0}" -f ($WorkerIPs -join ", "))
+  Write-Host ("VIP (MetalLB):    {0}" -f $VipIP)
+  Write-Host ""
+}
+
+# Validate IP formats (even in non-interactive mode)
+Assert-IPv4 $ControlPlaneIP "ControlPlaneIP"
+Assert-IPv4 $VipIP "VipIP"
+if (-not $WorkerIPs -or $WorkerIPs.Count -lt 1) { throw "You must provide at least one worker IP." }
+for ($i=0; $i -lt $WorkerIPs.Count; $i++) {
+  Assert-IPv4 $WorkerIPs[$i] ("WorkerIPs[{0}]" -f $i)
+}
+
 Write-Host "== CITA 360 Talos + Kubernetes Bootstrap ==" -ForegroundColor Cyan
 Write-Host "ClusterName:    $ClusterName"
 Write-Host "ControlPlaneIP: $ControlPlaneIP"
-Write-Host "Worker1IP:      $Worker1IP"
-Write-Host "Worker2IP:      $Worker2IP"
+Write-Host "Workers:        $($WorkerIPs -join ', ')"
 Write-Host "VIP (MetalLB):  $VipIP"
 Write-Host ""
 
@@ -80,10 +215,11 @@ Assert-Command kubectl
 Assert-Command git
 Assert-Command helm
 
-# Reachability checks
+# Reachability checks (all nodes)
 Assert-Reachable $ControlPlaneIP "Control Plane"
-Assert-Reachable $Worker1IP      "Worker 1"
-Assert-Reachable $Worker2IP      "Worker 2"
+for ($i=0; $i -lt $WorkerIPs.Count; $i++) {
+  Assert-Reachable $WorkerIPs[$i] ("Worker {0}" -f ($i+1))
+}
 
 # --- Talos: generate configs locally (secrets stay local)
 $OverridesDir = Join-Path $PSScriptRoot "01-talos\student-overrides"
@@ -94,8 +230,10 @@ talosctl gen config $ClusterName "https://$ControlPlaneIP`:6443" --output-dir $O
 
 Write-Host "`n[2/6] Applying Talos configs..." -ForegroundColor Yellow
 talosctl apply-config --insecure --nodes $ControlPlaneIP --file (Join-Path $OverridesDir "controlplane.yaml")
-talosctl apply-config --insecure --nodes $Worker1IP      --file (Join-Path $OverridesDir "worker.yaml")
-talosctl apply-config --insecure --nodes $Worker2IP      --file (Join-Path $OverridesDir "worker.yaml")
+
+foreach ($w in $WorkerIPs) {
+  talosctl apply-config --insecure --nodes $w --file (Join-Path $OverridesDir "worker.yaml")
+}
 
 Write-Host "`n[3/6] Bootstrapping Kubernetes control plane..." -ForegroundColor Yellow
 talosctl bootstrap --nodes $ControlPlaneIP --endpoints $ControlPlaneIP
@@ -126,7 +264,6 @@ Invoke-Kube -Args @("apply","-f",$metallbBase)
 $poolFile = Join-Path $PSScriptRoot "02-metallb\overlays\example\metallb-pool.yaml"
 if (Test-Path $poolFile) {
   $content = Get-Content $poolFile -Raw
-  # Replace any IPv4/32 entry line under addresses with the chosen VIP
   $content = [regex]::Replace($content, '(?m)^\s*-\s*\d{1,3}(\.\d{1,3}){3}/32\s*$', "    - $VipIP/32")
   Set-Content -Path $poolFile -Value $content -Encoding utf8
 }
