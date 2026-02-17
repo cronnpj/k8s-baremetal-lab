@@ -2,14 +2,17 @@
 bootstrap.ps1
 Run this on the Talos CTL VM (inside the isolated lab network).
 
-Behavior:
-- If cluster is already reachable (kubectl works), Talos config/apply/bootstrap is SKIPPED.
-- If cluster is not reachable, script performs Talos bootstrap then continues.
+Key behavior:
+- If an existing Talos config exists (01-talos\student-overrides\talosconfig), we REUSE it.
+- We DO NOT regenerate Talos secrets on reruns unless -ForceRegenTalos is set.
+- If kubeconfig already works, we skip Talos steps and continue to MetalLB/Ingress/App.
+- Use -InstallOnly to skip Talos apply/bootstrap entirely (for “just install MetalLB/Ingress”).
 
 Examples:
   .\bootstrap.ps1
+  .\bootstrap.ps1 -InstallOnly
   .\bootstrap.ps1 -ControlPlaneIP 192.168.1.13 -WorkerIPs 192.168.1.16,192.168.1.17 -VipIP 192.168.1.210
-  .\bootstrap.ps1 -TalosOnly
+  .\bootstrap.ps1 -ForceRegenTalos   # ONLY on fresh nodes
 #>
 
 [CmdletBinding()]
@@ -26,12 +29,21 @@ param(
 
   [string]$VipIP          = "192.168.1.200",
 
-  [switch]$TalosOnly
+  # Stop after Talos bootstrap + kubeconfig
+  [switch]$TalosOnly,
+
+  # Skip Talos apply/bootstrap; just ensure kubeconfig works and then install MetalLB/Ingress/App
+  [switch]$InstallOnly,
+
+  # Force regenerate Talos secrets/configs (ONLY for fresh nodes)
+  [switch]$ForceRegenTalos
 )
 
 $ErrorActionPreference = "Stop"
 
 $script:RepoKubeconfigPath = Join-Path $PSScriptRoot "kubeconfig"
+$script:OverridesDir       = Join-Path $PSScriptRoot "01-talos\student-overrides"
+$script:TalosConfigPath    = Join-Path $script:OverridesDir "talosconfig"
 
 # -------------------------
 # Helpers
@@ -115,16 +127,13 @@ function Test-KubectlWithKubeconfig {
   param([string]$Path)
   if (-not $Path) { return $false }
   if (-not (Test-Path $Path)) { return $false }
-
   & kubectl --kubeconfig $Path get nodes -o name 2>$null | Out-Null
   return ($LASTEXITCODE -eq 0)
 }
 
 function Resolve-WorkingKubeconfig {
-  # 1) repo-local kubeconfig (preferred for class)
   if (Test-KubectlWithKubeconfig -Path $script:RepoKubeconfigPath) { return $script:RepoKubeconfigPath }
 
-  # 2) default kubeconfig
   $default = Join-Path $HOME ".kube\config"
   if (Test-KubectlWithKubeconfig -Path $default) { return $default }
 
@@ -163,6 +172,24 @@ function Wait-ForIngressExternalIP {
   }
 }
 
+function Ensure-KubeconfigFromTalos {
+  param([string]$ControlPlaneIP)
+
+  if (-not (Test-Path $script:TalosConfigPath)) {
+    return $false
+  }
+
+  $env:TALOSCONFIG = $script:TalosConfigPath
+  Write-Host "Using existing TALOSCONFIG: $($script:TalosConfigPath)" -ForegroundColor DarkGray
+
+  if (Test-Path $script:RepoKubeconfigPath) { Remove-Item $script:RepoKubeconfigPath -Force }
+
+  # This requires the correct talosconfig (from the original secrets)
+  talosctl kubeconfig $script:RepoKubeconfigPath --nodes $ControlPlaneIP --endpoints $ControlPlaneIP --force | Out-Null
+
+  return (Test-KubectlWithKubeconfig -Path $script:RepoKubeconfigPath)
+}
+
 # -------------------------
 # Prompt logic
 # -------------------------
@@ -177,7 +204,9 @@ $ranWithExplicitValues =
   $boundKeys.Contains("WorkerIPs") -or
   $boundKeys.Contains("Worker1IP") -or
   $boundKeys.Contains("Worker2IP") -or
-  $boundKeys.Contains("VipIP")
+  $boundKeys.Contains("VipIP") -or
+  $boundKeys.Contains("InstallOnly") -or
+  $boundKeys.Contains("ForceRegenTalos")
 
 if (-not $ranWithExplicitValues) {
   Clear-Host
@@ -211,16 +240,16 @@ Assert-Command kubectl
 Assert-Command git
 Assert-Command helm
 
-# Basic reachability
+# Network checks
 Assert-Reachable $ControlPlaneIP "Control Plane"
 for ($i=0; $i -lt $WorkerIPs.Count; $i++) { Assert-Reachable $WorkerIPs[$i] ("Worker {0}" -f ($i+1)) }
 
 # -------------------------
-# NEW: If cluster is already reachable, skip Talos steps
+# 1) If kubectl already works, skip Talos and continue
 # -------------------------
 $KubeconfigPath = Resolve-WorkingKubeconfig
 if ($KubeconfigPath) {
-  Write-Host "Cluster appears reachable already. Skipping Talos apply/bootstrap." -ForegroundColor Green
+  Write-Host "Cluster reachable (kubectl works). Skipping Talos steps." -ForegroundColor Green
   Write-Host "Using kubeconfig: $KubeconfigPath" -ForegroundColor DarkGray
 
   if ($TalosOnly) {
@@ -229,71 +258,108 @@ if ($KubeconfigPath) {
   }
 }
 else {
-  # --- Talos bootstrap path
-  $OverridesDir = Join-Path $PSScriptRoot "01-talos\student-overrides"
-  New-Item -ItemType Directory -Force -Path $OverridesDir | Out-Null
+  # -------------------------
+  # 2) Try to fetch kubeconfig using EXISTING talosconfig (rerun scenario)
+  # -------------------------
+  New-Item -ItemType Directory -Force -Path $script:OverridesDir | Out-Null
 
-  Write-Host "`n[1/6] Generating Talos configs..." -ForegroundColor Yellow
-  talosctl gen config $ClusterName "https://$ControlPlaneIP`:6443" --output-dir $OverridesDir
+  if (-not $ForceRegenTalos -and (Test-Path $script:TalosConfigPath)) {
+    Write-Host "No working kubeconfig found. Attempting to fetch kubeconfig using existing talosconfig..." -ForegroundColor Yellow
+    $ok = Ensure-KubeconfigFromTalos -ControlPlaneIP $ControlPlaneIP
+    if ($ok) {
+      $KubeconfigPath = $script:RepoKubeconfigPath
+      Write-Host "Kubeconfig recovered successfully: $KubeconfigPath" -ForegroundColor Green
 
-  $TalosConfigPath = Join-Path $OverridesDir "talosconfig"
-  if (-not (Test-Path $TalosConfigPath)) { throw "Missing talosconfig at: $TalosConfigPath" }
-  $env:TALOSCONFIG = $TalosConfigPath
-  Write-Host "Using TALOSCONFIG: $TalosConfigPath" -ForegroundColor DarkGray
-
-  function Invoke-TalosApplyConfig {
-    param(
-      [Parameter(Mandatory=$true)][string]$NodeIP,
-      [Parameter(Mandatory=$true)][ValidateSet("controlplane","worker")][string]$Role
-    )
-
-    $file = if ($Role -eq "controlplane") { Join-Path $OverridesDir "controlplane.yaml" } else { Join-Path $OverridesDir "worker.yaml" }
-    if (-not (Test-Path $file)) { throw "Missing config file: $file" }
-
-    Write-Host "Applying $Role config to $NodeIP..." -ForegroundColor Gray
-
-    # Try insecure first (fresh nodes); if TLS required, retry using talosconfig
-    $out = talosctl apply-config --insecure --nodes $NodeIP --endpoints $ControlPlaneIP --file $file 2>&1 | Out-String
-    if ($LASTEXITCODE -eq 0) { return }
-
-    if ($out -match "certificate required") {
-      Write-Host "Node requires TLS; retrying apply-config using TALOSCONFIG..." -ForegroundColor Yellow
-      talosctl apply-config --nodes $NodeIP --endpoints $ControlPlaneIP --file $file
-      if ($LASTEXITCODE -ne 0) { throw "apply-config failed for ${NodeIP}" }
-      return
+      if ($TalosOnly) {
+        Write-Host "`nTalos-only mode complete (kubeconfig recovered)." -ForegroundColor Green
+        exit 0
+      }
     }
-
-    throw "apply-config failed for ${NodeIP}: $out"
+    elseif ($InstallOnly) {
+      throw "InstallOnly requested, but no kubeconfig works and kubeconfig recovery failed. You likely regenerated Talos secrets at some point or lost the original talosconfig. Restore the original '01-talos\student-overrides\talosconfig' from the first successful run, or rebuild the cluster."
+    }
   }
 
-  Write-Host "`n[2/6] Applying Talos configs..." -ForegroundColor Yellow
-  Invoke-TalosApplyConfig -NodeIP $ControlPlaneIP -Role "controlplane"
-  foreach ($w in $WorkerIPs) { Invoke-TalosApplyConfig -NodeIP $w -Role "worker" }
+  # If still no kubeconfig and InstallOnly is set, stop here.
+  if (-not $KubeconfigPath -and $InstallOnly) {
+    throw "InstallOnly requested but no kubeconfig is available. Either copy a working kubeconfig into the repo root as 'kubeconfig' or restore the original talosconfig so the script can fetch kubeconfig."
+  }
 
-  Write-Host "`n[3/6] Bootstrapping Kubernetes control plane..." -ForegroundColor Yellow
-  talosctl bootstrap --nodes $ControlPlaneIP --endpoints $ControlPlaneIP
+  # -------------------------
+  # 3) Fresh bootstrap path (only when needed)
+  # -------------------------
+  if (-not $KubeconfigPath) {
 
-  Write-Host "`n[4/6] Fetching kubeconfig..." -ForegroundColor Yellow
-  if (Test-Path $script:RepoKubeconfigPath) { Remove-Item $script:RepoKubeconfigPath -Force }
-  talosctl kubeconfig $script:RepoKubeconfigPath --nodes $ControlPlaneIP --endpoints $ControlPlaneIP --force
-  if (-not (Test-Path $script:RepoKubeconfigPath)) { throw "talosctl kubeconfig did not create: $($script:RepoKubeconfigPath)" }
+    if (-not $ForceRegenTalos -and (Test-Path $script:TalosConfigPath)) {
+      Write-Host "Existing talosconfig found, but kubeconfig is still not usable. Proceeding with Talos bootstrap using existing talosconfig..." -ForegroundColor Yellow
+      $env:TALOSCONFIG = $script:TalosConfigPath
+    }
+    else {
+      Write-Host "`n[1/6] Generating Talos configs..." -ForegroundColor Yellow
+      talosctl gen config $ClusterName "https://$ControlPlaneIP`:6443" --output-dir $script:OverridesDir
 
-  $KubeconfigPath = $script:RepoKubeconfigPath
-  Write-Host "Kubeconfig created: $KubeconfigPath" -ForegroundColor Green
+      if (-not (Test-Path $script:TalosConfigPath)) { throw "Missing talosconfig at: $($script:TalosConfigPath)" }
+      $env:TALOSCONFIG = $script:TalosConfigPath
+      Write-Host "Using TALOSCONFIG: $($script:TalosConfigPath)" -ForegroundColor DarkGray
+    }
 
-  Write-Host "`nVerifying nodes (may take a minute)..." -ForegroundColor Yellow
-  Invoke-Kube -KubeconfigPath $KubeconfigPath -Args @("get","nodes","-o","wide")
+    function Invoke-TalosApplyConfig {
+      param(
+        [Parameter(Mandatory=$true)][string]$NodeIP,
+        [Parameter(Mandatory=$true)][ValidateSet("controlplane","worker")][string]$Role
+      )
 
-  if ($TalosOnly) {
-    Write-Host "`nTalos-only mode complete." -ForegroundColor Green
-    exit 0
+      $file = if ($Role -eq "controlplane") { Join-Path $script:OverridesDir "controlplane.yaml" } else { Join-Path $script:OverridesDir "worker.yaml" }
+      if (-not (Test-Path $file)) { throw "Missing config file: $file" }
+
+      Write-Host "Applying $Role config to $NodeIP..." -ForegroundColor Gray
+
+      # Try insecure first (fresh nodes)
+      $out = talosctl apply-config --insecure --nodes $NodeIP --endpoints $ControlPlaneIP --file $file 2>&1 | Out-String
+      if ($LASTEXITCODE -eq 0) { return }
+
+      # If TLS required, try secure ONLY if we are using a pre-existing talosconfig (rerun case)
+      if ($out -match "certificate required") {
+        Write-Host "Node requires TLS; retrying apply-config using TALOSCONFIG..." -ForegroundColor Yellow
+        talosctl apply-config --nodes $NodeIP --endpoints $ControlPlaneIP --file $file
+        if ($LASTEXITCODE -ne 0) { throw "apply-config failed for ${NodeIP}" }
+        return
+      }
+
+      throw "apply-config failed for ${NodeIP}: $out"
+    }
+
+    Write-Host "`n[2/6] Applying Talos configs..." -ForegroundColor Yellow
+    Invoke-TalosApplyConfig -NodeIP $ControlPlaneIP -Role "controlplane"
+    foreach ($w in $WorkerIPs) { Invoke-TalosApplyConfig -NodeIP $w -Role "worker" }
+
+    Write-Host "`n[3/6] Bootstrapping Kubernetes control plane..." -ForegroundColor Yellow
+    talosctl bootstrap --nodes $ControlPlaneIP --endpoints $ControlPlaneIP
+
+    Write-Host "`n[4/6] Fetching kubeconfig..." -ForegroundColor Yellow
+    if (Test-Path $script:RepoKubeconfigPath) { Remove-Item $script:RepoKubeconfigPath -Force }
+    talosctl kubeconfig $script:RepoKubeconfigPath --nodes $ControlPlaneIP --endpoints $ControlPlaneIP --force | Out-Null
+
+    if (-not (Test-Path $script:RepoKubeconfigPath)) {
+      throw "talosctl kubeconfig did not create: $($script:RepoKubeconfigPath)"
+    }
+
+    $KubeconfigPath = $script:RepoKubeconfigPath
+    Write-Host "Kubeconfig created: $KubeconfigPath" -ForegroundColor Green
+
+    Write-Host "`nVerifying nodes (may take a minute)..." -ForegroundColor Yellow
+    Invoke-Kube -KubeconfigPath $KubeconfigPath -Args @("get","nodes","-o","wide")
+
+    if ($TalosOnly) {
+      Write-Host "`nTalos-only mode complete." -ForegroundColor Green
+      exit 0
+    }
   }
 }
 
 # -------------------------
 # MetalLB + Ingress + App
 # -------------------------
-
 Write-Host "`n[5/6] Installing MetalLB..." -ForegroundColor Yellow
 
 $metallbBase    = Join-Path $PSScriptRoot "02-metallb\base"
@@ -304,7 +370,7 @@ if (-not (Test-Path $metallbOverlay)) { throw "Missing folder: $metallbOverlay" 
 
 Invoke-Kube -KubeconfigPath $KubeconfigPath -Args @("apply","-f",$metallbBase)
 
-# Update VIP in pool automatically
+# Auto-update VIP in pool
 $poolFile = Join-Path $PSScriptRoot "02-metallb\overlays\example\metallb-pool.yaml"
 if (Test-Path $poolFile) {
   $content = Get-Content $poolFile -Raw
