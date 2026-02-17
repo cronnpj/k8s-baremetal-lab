@@ -1,0 +1,11 @@
+@"
+# NEVER COMMIT GENERATED TALOS CONFIGS
+01-talos/**/controlplane*.yaml
+01-talos/**/worker*.yaml
+
+# NEVER COMMIT CREDENTIALS
+kubeconfig
+talosconfig
+*.kubeconfig
+*.talosconfig
+"@ | Out-File -Encoding ascii .gitignore
