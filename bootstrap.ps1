@@ -37,6 +37,9 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# Single source of truth for kubeconfig path
+$script:KubeconfigPath = Join-Path $PSScriptRoot "kubeconfig"
+
 # -------------------------
 # Helpers
 # -------------------------
@@ -128,8 +131,12 @@ function Read-IPv4ListPrompt {
 
 function Invoke-Kube {
   param([Parameter(ValueFromRemainingArguments=$true)][string[]]$Args)
-  $kubeconfigPath = Join-Path $PSScriptRoot "kubeconfig"
-  & kubectl --kubeconfig $kubeconfigPath @Args
+
+  if (-not (Test-Path $script:KubeconfigPath)) {
+    throw "kubeconfig not found at: $($script:KubeconfigPath). Talos kubeconfig step may have failed."
+  }
+
+  & kubectl --kubeconfig $script:KubeconfigPath @Args
 }
 
 function Wait-ForIngressExternalIP {
@@ -180,10 +187,10 @@ if (-not $ranWithExplicitValues) {
 
   $defaultWorkers = @("192.168.1.6", "192.168.1.7")
 
-  $ClusterName    = Read-Default     -Prompt "Cluster name"       -Default $ClusterName
-  $ControlPlaneIP = Read-IPv4Prompt  -Prompt "Control Plane IP"   -Default $ControlPlaneIP
-  $WorkerIPs      = Read-IPv4ListPrompt -Prompt "Worker node IPs" -Defaults $defaultWorkers
-  $VipIP          = Read-IPv4Prompt  -Prompt "VIP (MetalLB) IP"   -Default $VipIP
+  $ClusterName    = Read-Default         -Prompt "Cluster name"       -Default $ClusterName
+  $ControlPlaneIP = Read-IPv4Prompt      -Prompt "Control Plane IP"   -Default $ControlPlaneIP
+  $WorkerIPs      = Read-IPv4ListPrompt  -Prompt "Worker node IPs"    -Defaults $defaultWorkers
+  $VipIP          = Read-IPv4Prompt      -Prompt "VIP (MetalLB) IP"   -Default $VipIP
 
   Write-Host ""
   Write-Host "Using configuration:" -ForegroundColor Green
@@ -239,7 +246,19 @@ Write-Host "`n[3/6] Bootstrapping Kubernetes control plane..." -ForegroundColor 
 talosctl bootstrap --nodes $ControlPlaneIP --endpoints $ControlPlaneIP
 
 Write-Host "`n[4/6] Fetching kubeconfig into repo root..." -ForegroundColor Yellow
-talosctl kubeconfig $PSScriptRoot --nodes $ControlPlaneIP --endpoints $ControlPlaneIP
+
+# Ensure kubeconfig is always written to a known file path (and overwrite if exists)
+if (Test-Path $script:KubeconfigPath) { Remove-Item $script:KubeconfigPath -Force }
+talosctl kubeconfig $script:KubeconfigPath --nodes $ControlPlaneIP --endpoints $ControlPlaneIP --force
+
+if (-not (Test-Path $script:KubeconfigPath)) {
+  throw "talosctl kubeconfig did not create: $($script:KubeconfigPath)"
+}
+
+Write-Host "Kubeconfig created: $($script:KubeconfigPath)" -ForegroundColor Green
+
+Write-Host "`nVerifying cluster access..." -ForegroundColor Yellow
+Invoke-Kube -Args @("cluster-info")
 
 Write-Host "`nVerifying nodes (may take a minute)..." -ForegroundColor Yellow
 Invoke-Kube -Args @("get","nodes","-o","wide")
@@ -277,7 +296,7 @@ helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx | Out-Nul
 helm repo update | Out-Null
 
 # Use kubeconfig explicitly for helm
-$env:KUBECONFIG = Join-Path $PSScriptRoot "kubeconfig"
+$env:KUBECONFIG = $script:KubeconfigPath
 
 helm upgrade --install ingress-nginx ingress-nginx/ingress-nginx `
   --namespace ingress-nginx --create-namespace `
