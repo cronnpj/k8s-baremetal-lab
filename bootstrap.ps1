@@ -1,5 +1,5 @@
 <#
-bootstrap.ps1
+bootstrap.ps1 (simple + reliable)
 
 Assumptions (lab standard):
 - Run on Win11 "CTL" VM (management workstation).
@@ -23,9 +23,10 @@ Notes:
 
 This version includes:
 - MetalLB install via official manifest (Option A)
-- deterministic waits for CRDs, controller/speaker, webhook endpoints
-- robust pool apply verification (no more webhook race)
+- deterministic waits for CRDs, controller/speaker, webhook endpoints (more tolerant)
+- diagnostics on webhook timeout (pods/svc/endpoints/events/logs)
 - fixed kubectl passthrough wrapper (no -o ambiguous issues)
+- extra progress output so it doesn't look "hung"
 #>
 
 [CmdletBinding()]
@@ -38,6 +39,9 @@ param(
   [int]$TimeoutTalosApiSeconds = 420,
   [int]$TimeoutK8sApiSeconds   = 600,
   [int]$TimeoutKubectlSeconds  = 600,
+
+  # MetalLB webhook readiness can be slow on fresh clusters
+  [int]$TimeoutMetalLbWebhookSeconds = 420,
 
   # If you ever need to re-run after configs already applied:
   [switch]$SkipApply,
@@ -96,8 +100,6 @@ function Wait-ForPort([string]$Ip,[int]$Port,[int]$TimeoutSeconds,[string]$Label
 }
 
 function Wait-ForPortDownThenUp([string]$Ip,[int]$Port,[int]$TimeoutSeconds,[string]$Label) {
-  # Useful right after apply-config when the node reboots:
-  # wait for port to go down (briefly), then back up.
   $start = Get-Date
   $sawDown = $false
 
@@ -107,7 +109,6 @@ function Wait-ForPortDownThenUp([string]$Ip,[int]$Port,[int]$TimeoutSeconds,[str
     if ($sawDown -and $open) { return $true }
 
     if (((Get-Date)-$start).TotalSeconds -ge $TimeoutSeconds) {
-      # If we never observed a down, still accept "up" as success.
       if ($open) { return $true }
       throw "${Label} did not restart in time: ${Ip}:${Port}"
     }
@@ -162,8 +163,6 @@ function Set-TalosContext {
 
 function Talos-Apply([string]$NodeIP,[string]$FilePath) {
   Write-Host "Applying config to ${NodeIP} ..." -ForegroundColor Gray
-
-  # For maintenance apply, endpoints should be the node itself (most reliable)
   $out = & talosctl apply-config --insecure --nodes $NodeIP --endpoints $NodeIP --file $FilePath 2>&1
 
   if ($LASTEXITCODE -ne 0) {
@@ -183,7 +182,6 @@ function Talos-Apply([string]$NodeIP,[string]$FilePath) {
 
 function Talos-Bootstrap {
   Write-Host "Bootstrapping etcd/Kubernetes on control plane..." -ForegroundColor Gray
-
   $out = & talosctl bootstrap --nodes $ControlPlaneIP --endpoints $ControlPlaneIP 2>&1
 
   if ($LASTEXITCODE -ne 0) {
@@ -211,7 +209,6 @@ function Talos-Bootstrap {
 
 function Talos-Kubeconfig {
   Write-Host "Fetching kubeconfig..." -ForegroundColor Gray
-
   $out = & talosctl kubeconfig $Kubeconfig --nodes $ControlPlaneIP --endpoints $ControlPlaneIP --force 2>&1
 
   if ($LASTEXITCODE -ne 0) {
@@ -232,7 +229,7 @@ function Wait-ForEndpointSubsets {
   param(
     [string]$Namespace,
     [string]$EndpointName,
-    [int]$TimeoutSeconds = 180
+    [int]$TimeoutSeconds = 420
   )
 
   $start = Get-Date
@@ -246,8 +243,24 @@ function Wait-ForEndpointSubsets {
     } catch { }
 
     if (((Get-Date) - $start).TotalSeconds -ge $TimeoutSeconds) {
+      Write-Host ""
+      Write-Host "Webhook endpoints not ready after ${TimeoutSeconds}s. Dumping diagnostics..." -ForegroundColor Yellow
+
+      & kubectl --kubeconfig $Kubeconfig -n $Namespace get pods -o wide
+      & kubectl --kubeconfig $Kubeconfig -n $Namespace get svc -o wide
+      & kubectl --kubeconfig $Kubeconfig -n $Namespace get endpoints $EndpointName -o wide
+
+      Write-Host ""
+      Write-Host "Recent metallb-system events:" -ForegroundColor Yellow
+      & kubectl --kubeconfig $Kubeconfig -n $Namespace get events --sort-by=.lastTimestamp | Select-Object -Last 40
+
+      Write-Host ""
+      Write-Host "controller logs (tail):" -ForegroundColor Yellow
+      & kubectl --kubeconfig $Kubeconfig -n $Namespace logs deploy/controller --tail=120
+
       throw "Endpoints not ready in time: ${Namespace}/${EndpointName}"
     }
+
     Start-Sleep -Seconds 3
   }
 }
@@ -257,20 +270,24 @@ function Install-MetalLB {
 
   # Option A: official manifest (includes CRDs)
   $manifest = "https://raw.githubusercontent.com/metallb/metallb/v0.14.8/config/manifests/metallb-native.yaml"
+
+  Write-Host " - Applying MetalLB manifest..." -ForegroundColor Gray
   Kube apply -f $manifest | Out-Null
 
-  # Wait for CRDs to be established so IPAddressPool/L2Advertisement are recognized
+  Write-Host " - Waiting for CRDs..." -ForegroundColor Gray
   Kube wait --for=condition=Established crd/ipaddresspools.metallb.io --timeout=180s | Out-Null
   Kube wait --for=condition=Established crd/l2advertisements.metallb.io --timeout=180s | Out-Null
 
-  # Wait for controller + speaker to be ready
+  Write-Host " - Waiting for controller deployment..." -ForegroundColor Gray
   Kube rollout status deployment/controller -n metallb-system --timeout=240s | Out-Null
+
+  Write-Host " - Waiting for speaker DaemonSet..." -ForegroundColor Gray
   Kube rollout status daemonset/speaker -n metallb-system --timeout=240s | Out-Null
 
-  # Wait for webhook endpoints (prevents "context deadline exceeded" race)
-  Wait-ForEndpointSubsets -Namespace "metallb-system" -EndpointName "metallb-webhook-service" -TimeoutSeconds 180 | Out-Null
+  Write-Host " - Waiting for webhook endpoints..." -ForegroundColor Gray
+  Wait-ForEndpointSubsets -Namespace "metallb-system" -EndpointName "metallb-webhook-service" -TimeoutSeconds $TimeoutMetalLbWebhookSeconds | Out-Null
 
-  # Apply your IP pool + advertisement (patch VIP)
+  Write-Host " - Applying IPAddressPool/L2Advertisement (VIP: $VipIP)..." -ForegroundColor Gray
   $poolFile = Join-Path $RepoRoot "02-metallb\overlays\example\metallb-pool.yaml"
   if (-not (Test-Path $poolFile)) { throw "Missing file: $poolFile" }
 
@@ -282,10 +299,9 @@ function Install-MetalLB {
   )
   Set-Content -Path $poolFile -Value $content -Encoding utf8
 
-  # Apply (now deterministic)
   Kube apply -f $poolFile | Out-Null
 
-  # Verify pool exists
+  Write-Host " - Verifying IPAddressPool exists..." -ForegroundColor Gray
   $start = Get-Date
   while ($true) {
     $out = & kubectl --kubeconfig $Kubeconfig -n metallb-system get ipaddresspools 2>$null
@@ -299,7 +315,6 @@ function Install-IngressNginx {
   Show-Header "Installing ingress-nginx (Helm)" "Yellow"
 
   $env:KUBECONFIG = $Kubeconfig
-
   helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx | Out-Null
   helm repo update | Out-Null
 
@@ -336,7 +351,6 @@ Assert-Command talosctl
 Assert-Command kubectl
 Assert-Command helm
 
-# Quick time sanity marker (helps debug TLS issues)
 Show-Header "Time sanity check (Windows)" "Yellow"
 Write-Host "Windows time: $(Get-Date)" -ForegroundColor Gray
 
@@ -389,7 +403,6 @@ Write-Host ""
 Write-Host "Kubernetes is up." -ForegroundColor Green
 
 if (-not $SkipAddons) {
-  # Helpful to ensure DNS is up before webhook-based resources
   Show-Header "Ensuring CoreDNS is ready" "Yellow"
   Kube rollout status deployment/coredns -n kube-system --timeout=240s | Out-Null
 
