@@ -23,11 +23,11 @@ Notes:
 
 This version includes:
 - MetalLB install via official manifest (Option A)
-- deterministic waits for CRDs, controller/speaker, webhook endpoints (more tolerant)
-- diagnostics on webhook timeout (pods/svc/endpoints/events/logs)
+- deterministic waits for CRDs, controller/speaker, webhook readiness
+- webhook readiness uses EndpointSlice (avoids Endpoints deprecation warning + stderr Stop)
+- diagnostics on webhook timeout (pods/svc/endpointslice/events/logs)
 - fixed kubectl passthrough wrapper (no -o ambiguous issues)
 - extra progress output so it doesn't look "hung"
-- webhook endpoint wait uses simple text match (robust across Endpoints/EndpointSlice changes)
 #>
 
 [CmdletBinding()]
@@ -235,10 +235,21 @@ function Wait-ForMetalLbWebhookReady {
 
   $start = Get-Date
   while ($true) {
-    # Simple, robust check: if the endpoints output contains an IPv4, we're ready
-    $out = & kubectl --kubeconfig $Kubeconfig -n $Namespace get endpoints $ServiceName 2>$null
-    if ($LASTEXITCODE -eq 0 -and $out -match '\d+\.\d+\.\d+\.\d+') {
-      return $true
+    # Use EndpointSlice (avoids Endpoints deprecation warning and stderr Stop)
+    $json = & kubectl --kubeconfig $Kubeconfig -n $Namespace `
+      get endpointslice -l "kubernetes.io/service-name=$ServiceName" -o json 2>$null
+
+    if ($LASTEXITCODE -eq 0 -and $json) {
+      try {
+        $obj = $json | ConvertFrom-Json
+        foreach ($item in @($obj.items)) {
+          foreach ($ep in @($item.endpoints)) {
+            foreach ($addr in @($ep.addresses)) {
+              if ($addr -match '^\d+\.\d+\.\d+\.\d+$') { return $true }
+            }
+          }
+        }
+      } catch { }
     }
 
     if (((Get-Date) - $start).TotalSeconds -ge $TimeoutSeconds) {
@@ -247,7 +258,7 @@ function Wait-ForMetalLbWebhookReady {
 
       & kubectl --kubeconfig $Kubeconfig -n $Namespace get pods -o wide
       & kubectl --kubeconfig $Kubeconfig -n $Namespace get svc -o wide
-      & kubectl --kubeconfig $Kubeconfig -n $Namespace get endpoints $ServiceName -o wide
+      & kubectl --kubeconfig $Kubeconfig -n $Namespace get endpointslice -l "kubernetes.io/service-name=$ServiceName" -o wide
 
       Write-Host ""
       Write-Host "Recent metallb-system events:" -ForegroundColor Yellow
@@ -257,7 +268,7 @@ function Wait-ForMetalLbWebhookReady {
       Write-Host "controller logs (tail):" -ForegroundColor Yellow
       & kubectl --kubeconfig $Kubeconfig -n $Namespace logs deploy/controller --tail=120
 
-      throw "Endpoints not ready in time: ${Namespace}/${ServiceName}"
+      throw "Webhook EndpointSlice not ready in time: ${Namespace}/${ServiceName}"
     }
 
     Start-Sleep -Seconds 3
