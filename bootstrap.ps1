@@ -569,7 +569,7 @@ spec:
 
   # Create token (v1.24+)
   Write-Host ""
-  Write-Host "Dashboard URL (after DNS is set): https://$dashHost" -ForegroundColor Cyan
+  Write-Host "Dashboard URL: https://$dashHost" -ForegroundColor Cyan
   Write-Host "Token (copy/paste into dashboard):" -ForegroundColor Cyan
   & kubectl --kubeconfig $Kubeconfig -n kubernetes-dashboard create token dashboard-admin
 }
