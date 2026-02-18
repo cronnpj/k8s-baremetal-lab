@@ -530,8 +530,8 @@ subjects:
   }
 
   # Ingress example (host-based). Students can map DNS later.
-  # Host: dashboard.192.168.1.200 (example)
-  $dashHost = "dashboard.$VipIP"
+  # Host: dashboard.192.168.1.200.nip.io (example)
+  $dashHost = "dashboard.$VipIP.nip.io"
 
   Write-Host "- Creating Ingress (host: $dashHost)..." -ForegroundColor Gray
 
