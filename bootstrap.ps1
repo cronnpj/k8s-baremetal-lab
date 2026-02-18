@@ -16,9 +16,15 @@ Usage:
   .\bootstrap.ps1
   .\bootstrap.ps1 -ControlPlaneIP 192.168.1.13 -WorkerIPs 192.168.1.15,192.168.1.16 -VipIP 192.168.1.210
 
-Dashboard (optional):
-  .\bootstrap.ps1 -InstallDashboard
+Add-ons / utilities:
+  # Install ONLY MetalLB (requires kubeconfig already present or talosctl to fetch it)
+  .\bootstrap.ps1 -AddonsOnly -InstallMetalLB
+
+  # Install ONLY Dashboard (requires kubeconfig already present or talosctl to fetch it)
   .\bootstrap.ps1 -DashboardOnly -InstallDashboard
+
+  # Install both add-ons (requires kubeconfig already present or talosctl to fetch it)
+  .\bootstrap.ps1 -AddonsOnly -InstallMetalLB -InstallDashboard
 
 Notes:
 - apply-config uses --insecure (maintenance API).
@@ -43,7 +49,11 @@ param(
 
   # Dashboard
   [switch]$InstallDashboard,
-  [switch]$DashboardOnly
+  [switch]$DashboardOnly,
+
+  # Add-ons only (no rebuild)
+  [switch]$InstallMetalLB,
+  [switch]$AddonsOnly
 )
 
 $ErrorActionPreference = "Stop"
@@ -243,6 +253,20 @@ function Wait-ForDaemonSetReady([string]$Namespace,[string]$DaemonSet,[int]$Time
   }
 }
 
+function Ensure-KubeReady {
+  Assert-Command kubectl
+
+  if (-not (Test-Path $Kubeconfig)) {
+    # If kubeconfig is missing but we're in add-ons mode, we can fetch it via Talos
+    Assert-Command talosctl
+    Show-Header "kubeconfig missing; fetching via talosctl" "Yellow"
+    Set-TalosContext
+    Talos-Kubeconfig
+  }
+
+  Wait-ForKubectl $Kubeconfig $TimeoutKubectlSeconds
+}
+
 # --------------------------------------------
 # MetalLB (repo-independent core install)
 # --------------------------------------------
@@ -315,6 +339,7 @@ spec:
 function Install-IngressNginx {
   Show-Header "Installing ingress-nginx (Helm)" "Yellow"
 
+  Assert-Command helm
   $env:KUBECONFIG = $Kubeconfig
 
   helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx | Out-Null
@@ -343,8 +368,9 @@ function Install-AppAndIngress {
 function Install-KubernetesDashboard {
   Show-Header "Installing Kubernetes Dashboard" "Yellow"
 
-  # Install official recommended manifest (stable for labs)
+  # Stable manifest (Helm repo URL was causing 404s)
   $dashUrl = "https://raw.githubusercontent.com/kubernetes/dashboard/v2.7.0/aio/deploy/recommended.yaml"
+
   Write-Host "- Applying dashboard manifest..." -ForegroundColor Gray
   Kube apply -f $dashUrl | Out-Null
 
@@ -375,7 +401,7 @@ subjects:
 "@
   $rbac | Kube apply -f - | Out-Null
 
-  # Example host without DNS (hosts-file later):
+  # Example host for the lab (later students do real DNS):
   $dashHost = "dashboard.$VipIP"
 
   Write-Host "- Creating Ingress (host: $dashHost)..." -ForegroundColor Gray
@@ -423,17 +449,6 @@ spec:
   }
 }
 
-function Ensure-KubeReady {
-  Assert-Command kubectl
-  if (-not (Test-Path $Kubeconfig)) {
-    Assert-Command talosctl
-    Show-Header "kubeconfig missing; fetching via talosctl" "Yellow"
-    Set-TalosContext
-    Talos-Kubeconfig
-  }
-  Wait-ForKubectl $Kubeconfig $TimeoutKubectlSeconds
-}
-
 # -------------------------
 # Main
 # -------------------------
@@ -453,6 +468,24 @@ if ($DashboardOnly) {
   } else {
     Write-Host "Nothing to do: -DashboardOnly was set but -InstallDashboard was not." -ForegroundColor DarkYellow
   }
+
+  Write-Host ""
+  Write-Host "Done." -ForegroundColor Green
+  return
+}
+
+# Addons-only mode (no Talos rebuild)
+if ($AddonsOnly) {
+  Show-Header "Add-ons only mode" "DarkYellow"
+  Ensure-KubeReady
+
+  if ($InstallMetalLB)     { Install-MetalLB }
+  if ($InstallDashboard)   { Install-KubernetesDashboard }
+
+  Show-Header "Add-ons summary" "Cyan"
+  Kube get pods -A
+  Kube get svc -A
+  Kube get ingress -A
 
   Write-Host ""
   Write-Host "Done." -ForegroundColor Green
