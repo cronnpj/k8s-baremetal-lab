@@ -27,6 +27,7 @@ This version includes:
 - diagnostics on webhook timeout (pods/svc/endpoints/events/logs)
 - fixed kubectl passthrough wrapper (no -o ambiguous issues)
 - extra progress output so it doesn't look "hung"
+- webhook endpoint wait uses simple text match (robust across Endpoints/EndpointSlice changes)
 #>
 
 [CmdletBinding()]
@@ -225,22 +226,20 @@ function Kube {
   & kubectl --kubeconfig $Kubeconfig @args
 }
 
-function Wait-ForEndpointSubsets {
+function Wait-ForMetalLbWebhookReady {
   param(
-    [string]$Namespace,
-    [string]$EndpointName,
+    [string]$Namespace = "metallb-system",
+    [string]$ServiceName = "metallb-webhook-service",
     [int]$TimeoutSeconds = 420
   )
 
   $start = Get-Date
   while ($true) {
-    try {
-      $json = & kubectl --kubeconfig $Kubeconfig -n $Namespace get endpoints $EndpointName -o json 2>$null
-      if ($LASTEXITCODE -eq 0 -and $json) {
-        $eps = $json | ConvertFrom-Json
-        if ($eps -and $eps.subsets -and $eps.subsets.Count -gt 0) { return $true }
-      }
-    } catch { }
+    # Simple, robust check: if the endpoints output contains an IPv4, we're ready
+    $out = & kubectl --kubeconfig $Kubeconfig -n $Namespace get endpoints $ServiceName 2>$null
+    if ($LASTEXITCODE -eq 0 -and $out -match '\d+\.\d+\.\d+\.\d+') {
+      return $true
+    }
 
     if (((Get-Date) - $start).TotalSeconds -ge $TimeoutSeconds) {
       Write-Host ""
@@ -248,7 +247,7 @@ function Wait-ForEndpointSubsets {
 
       & kubectl --kubeconfig $Kubeconfig -n $Namespace get pods -o wide
       & kubectl --kubeconfig $Kubeconfig -n $Namespace get svc -o wide
-      & kubectl --kubeconfig $Kubeconfig -n $Namespace get endpoints $EndpointName -o wide
+      & kubectl --kubeconfig $Kubeconfig -n $Namespace get endpoints $ServiceName -o wide
 
       Write-Host ""
       Write-Host "Recent metallb-system events:" -ForegroundColor Yellow
@@ -258,7 +257,7 @@ function Wait-ForEndpointSubsets {
       Write-Host "controller logs (tail):" -ForegroundColor Yellow
       & kubectl --kubeconfig $Kubeconfig -n $Namespace logs deploy/controller --tail=120
 
-      throw "Endpoints not ready in time: ${Namespace}/${EndpointName}"
+      throw "Endpoints not ready in time: ${Namespace}/${ServiceName}"
     }
 
     Start-Sleep -Seconds 3
@@ -285,7 +284,7 @@ function Install-MetalLB {
   Kube rollout status daemonset/speaker -n metallb-system --timeout=240s | Out-Null
 
   Write-Host " - Waiting for webhook endpoints..." -ForegroundColor Gray
-  Wait-ForEndpointSubsets -Namespace "metallb-system" -EndpointName "metallb-webhook-service" -TimeoutSeconds $TimeoutMetalLbWebhookSeconds | Out-Null
+  Wait-ForMetalLbWebhookReady -Namespace "metallb-system" -ServiceName "metallb-webhook-service" -TimeoutSeconds $TimeoutMetalLbWebhookSeconds | Out-Null
 
   Write-Host " - Applying IPAddressPool/L2Advertisement (VIP: $VipIP)..." -ForegroundColor Gray
   $poolFile = Join-Path $RepoRoot "02-metallb\overlays\example\metallb-pool.yaml"
@@ -304,8 +303,8 @@ function Install-MetalLB {
   Write-Host " - Verifying IPAddressPool exists..." -ForegroundColor Gray
   $start = Get-Date
   while ($true) {
-    $out = & kubectl --kubeconfig $Kubeconfig -n metallb-system get ipaddresspools 2>$null
-    if ($LASTEXITCODE -eq 0 -and $out -match "ingress-pool") { break }
+    $out2 = & kubectl --kubeconfig $Kubeconfig -n metallb-system get ipaddresspools 2>$null
+    if ($LASTEXITCODE -eq 0 -and $out2 -match "ingress-pool") { break }
     if (((Get-Date) - $start).TotalSeconds -ge 60) { throw "MetalLB IPAddressPool did not appear after apply." }
     Start-Sleep -Seconds 2
   }
