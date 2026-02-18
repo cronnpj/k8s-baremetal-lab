@@ -18,6 +18,7 @@ Usage:
   .\bootstrap.ps1 -Interactive
   .\bootstrap.ps1 -AddonsOnly -InstallMetalLB
   .\bootstrap.ps1 -DashboardOnly -InstallDashboard
+  .\bootstrap.ps1 -DashboardOnly -InstallDashboard -DashboardDomain doom.local
   .\bootstrap.ps1 -WipeAndRebuild -Interactive
 
 Key flags:
@@ -29,6 +30,7 @@ Key flags:
   -InstallNginx     Alias for -InstallIngress (menu compatibility)
   -InstallApp       Deploy sample app + ingress
   -InstallDashboard Install Kubernetes Dashboard (Ingress + token)
+  -DashboardDomain  Base domain for dashboard host (e.g., doom.local -> dashboard.doom.local)
   -DashboardOnly    Only dashboard install (assumes ingress + VIP already working)
 
 Notes:
@@ -63,7 +65,8 @@ param(
   [Alias('InstallNginx')]
   [switch]$InstallIngress,
   [switch]$InstallApp,
-  [switch]$InstallDashboard
+  [switch]$InstallDashboard,
+  [string]$DashboardDomain = ""
 )
 
 Set-StrictMode -Version Latest
@@ -294,6 +297,29 @@ function Read-WorkerIPs([string[]]$DefaultWorkers) {
   return $list.ToArray()
 }
 
+function Resolve-DashboardHost([string]$VipIP,[string]$ConfiguredDomain="") {
+  $candidate = $ConfiguredDomain
+
+  while ($true) {
+    if ([string]::IsNullOrWhiteSpace($candidate)) {
+      $candidate = Read-Host "Dashboard base domain (example doom.local). Leave blank for $VipIP.sslip.io"
+    }
+
+    if ([string]::IsNullOrWhiteSpace($candidate)) {
+      return "dashboard.$VipIP.sslip.io"
+    }
+
+    $base = $candidate.Trim().TrimStart('.')
+    if ($base -match '^[A-Za-z0-9][A-Za-z0-9.-]*$') {
+      if ($base.ToLower().StartsWith('dashboard.')) { return $base }
+      return "dashboard.$base"
+    }
+
+    Write-Host "Invalid domain format. Try again (example: doom.local)." -ForegroundColor DarkYellow
+    $candidate = ""
+  }
+}
+
 # -------------------------
 # Add-ons
 # -------------------------
@@ -488,6 +514,8 @@ function Validate-VIPHttp {
 }
 
 function Install-KubernetesDashboard {
+  param([Parameter(Mandatory)][string]$DashboardHost)
+
   Show-Header "Installing Kubernetes Dashboard (Ingress + token)" "Yellow"
 
   # Official recommended install (manifest). Helm repo has moved/broken frequently; manifest is stable.
@@ -531,9 +559,8 @@ subjects:
     Remove-Item -Force -ErrorAction SilentlyContinue $tmp
   }
 
-  # Ingress example (host-based). Students can map DNS later.
-  # Host: dashboard.192.168.1.200.sslip.io (example)
-  $dashHost = "dashboard.$VipIP.sslip.io"
+  # Ingress host can use a local lab domain (recommended) or sslip fallback.
+  $dashHost = $DashboardHost
 
   Write-Host "- Creating Ingress (host: $dashHost)..." -ForegroundColor Gray
 
@@ -545,7 +572,7 @@ metadata:
   namespace: kubernetes-dashboard
   annotations:
     nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"
-    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/ssl-redirect: "false"
 spec:
   ingressClassName: nginx
   rules:
@@ -571,7 +598,8 @@ spec:
 
   # Create token (v1.24+)
   Write-Host ""
-  Write-Host "Dashboard URL: https://$dashHost" -ForegroundColor Cyan
+  Write-Host "Dashboard URL: http://$dashHost" -ForegroundColor Cyan
+  Write-Host "If DNS is not configured, add hosts entry: $VipIP $dashHost" -ForegroundColor DarkGray
   Write-Host "Token (copy/paste into dashboard):" -ForegroundColor Cyan
   & kubectl --kubeconfig $Kubeconfig -n kubernetes-dashboard create token dashboard-admin
 }
@@ -618,12 +646,18 @@ Write-Host "Workers:        $($WorkerIPs -join ', ')"
 Write-Host "VIP (MetalLB):  $VipIP"
 Write-Host ""
 
+$ResolvedDashboardHost = $null
+if ($DashboardOnly -or $InstallDashboard) {
+  $ResolvedDashboardHost = Resolve-DashboardHost -VipIP $VipIP -ConfiguredDomain $DashboardDomain
+  Write-Host "Dashboard host: $ResolvedDashboardHost" -ForegroundColor DarkGray
+}
+
 # Dashboard-only: assumes kubeconfig exists and cluster is reachable
 if ($DashboardOnly) {
   Show-Header "Dashboard-only mode" "DarkYellow"
   if (-not (Test-Path $Kubeconfig)) { throw "kubeconfig not found at: $Kubeconfig (run bootstrap first)" }
   Ensure-CoreDNSReady
-  Install-KubernetesDashboard
+  Install-KubernetesDashboard -DashboardHost $ResolvedDashboardHost
   Write-Host ""
   Write-Host "Done." -ForegroundColor Green
   return
@@ -639,7 +673,7 @@ if ($AddonsOnly) {
   if ($InstallMetalLB) { Install-MetalLB }
   if ($InstallIngress) { Install-IngressNginx }
   if ($InstallApp)     { Install-AppAndIngress }
-  if ($InstallDashboard) { Install-KubernetesDashboard }
+  if ($InstallDashboard) { Install-KubernetesDashboard -DashboardHost $ResolvedDashboardHost }
 
   Validate-VIPHttp
 
@@ -709,7 +743,7 @@ if (-not $SkipAddons) {
   if ($InstallMetalLB) { Install-MetalLB }
   if ($InstallIngress) { Install-IngressNginx }
   if ($InstallApp)     { Install-AppAndIngress }
-  if ($InstallDashboard) { Install-KubernetesDashboard }
+  if ($InstallDashboard) { Install-KubernetesDashboard -DashboardHost $ResolvedDashboardHost }
 } else {
   Show-Header "Skipping add-ons (SkipAddons set)" "DarkYellow"
 }
