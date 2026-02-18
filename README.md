@@ -7,6 +7,7 @@ This lab walks you through building a fully functional **bare-metal Kubernetes c
 * **Talos Linux**
 * **MetalLB**
 * **NGINX Ingress Controller (Helm)**
+* **Portainer CE (Helm)**
 * **Sample NGINX Application**
 
 The goal is to build the cluster quickly and reliably so that we can focus on:
@@ -120,6 +121,7 @@ If you need to override:
 7. Waits for external IP assignment
 8. Deploys sample NGINX app
 9. Creates ingress rule
+10. Optionally installs Portainer CE + ingress host
 
 After completion:
 
@@ -128,6 +130,18 @@ http://192.168.1.200
 ```
 
 Should display the NGINX welcome page.
+
+Install Portainer only (after ingress/VIP are working):
+
+```powershell
+.\bootstrap.ps1 -PortainerOnly -InstallPortainer
+```
+
+Install Portainer with a custom host:
+
+```powershell
+.\bootstrap.ps1 -AddonsOnly -InstallPortainer -PortainerDomain doom.local
+```
 
 ---
 

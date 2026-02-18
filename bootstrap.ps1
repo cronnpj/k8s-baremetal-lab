@@ -17,8 +17,8 @@ Usage:
   .\bootstrap.ps1
   .\bootstrap.ps1 -Interactive
   .\bootstrap.ps1 -AddonsOnly -InstallMetalLB
-  .\bootstrap.ps1 -DashboardOnly -InstallDashboard
-  .\bootstrap.ps1 -DashboardOnly -InstallDashboard -DashboardDomain doom.local
+  .\bootstrap.ps1 -PortainerOnly -InstallPortainer
+  .\bootstrap.ps1 -PortainerOnly -InstallPortainer -PortainerDomain doom.local
   .\bootstrap.ps1 -WipeAndRebuild -Interactive
 
 Key flags:
@@ -29,9 +29,9 @@ Key flags:
   -InstallIngress   Install ingress-nginx (Helm)
   -InstallNginx     Alias for -InstallIngress (menu compatibility)
   -InstallApp       Deploy sample app + ingress
-  -InstallDashboard Install Kubernetes Dashboard (Ingress + token)
-  -DashboardDomain  Base domain for dashboard host (e.g., doom.local -> dashboard.doom.local)
-  -DashboardOnly    Only dashboard install (assumes ingress + VIP already working)
+  -InstallPortainer Install Portainer CE (Helm + Ingress)
+  -PortainerDomain  Base domain for Portainer host (e.g., doom.local -> portainer.doom.local)
+  -PortainerOnly    Only Portainer install (assumes ingress + VIP already working)
 
 Notes:
 - apply-config uses --insecure (maintenance API).
@@ -58,15 +58,18 @@ param(
 
   # Mode controls
   [switch]$AddonsOnly,
-  [switch]$DashboardOnly,
+  [Alias('DashboardOnly')]
+  [switch]$PortainerOnly,
 
   # Add-on selectors (can be combined with -AddonsOnly)
   [switch]$InstallMetalLB,
   [Alias('InstallNginx')]
   [switch]$InstallIngress,
   [switch]$InstallApp,
-  [switch]$InstallDashboard,
-  [string]$DashboardDomain = ""
+  [Alias('InstallDashboard')]
+  [switch]$InstallPortainer,
+  [Alias('DashboardDomain')]
+  [string]$PortainerDomain = ""
 )
 
 Set-StrictMode -Version Latest
@@ -297,22 +300,22 @@ function Read-WorkerIPs([string[]]$DefaultWorkers) {
   return $list.ToArray()
 }
 
-function Resolve-DashboardHost([string]$VipIP,[string]$ConfiguredDomain="") {
+function Resolve-PortainerHost([string]$VipIP,[string]$ConfiguredDomain="") {
   $candidate = $ConfiguredDomain
 
   while ($true) {
     if ([string]::IsNullOrWhiteSpace($candidate)) {
-      $candidate = Read-Host "Dashboard base domain (example doom.local). Leave blank for $VipIP.sslip.io"
+      $candidate = Read-Host "Portainer base domain (example doom.local). Leave blank for $VipIP.sslip.io"
     }
 
     if ([string]::IsNullOrWhiteSpace($candidate)) {
-      return "dashboard.$VipIP.sslip.io"
+      return "portainer.$VipIP.sslip.io"
     }
 
     $base = $candidate.Trim().TrimStart('.')
     if ($base -match '^[A-Za-z0-9][A-Za-z0-9.-]*$') {
-      if ($base.ToLower().StartsWith('dashboard.')) { return $base }
-      return "dashboard.$base"
+      if ($base.ToLower().StartsWith('portainer.')) { return $base }
+      return "portainer.$base"
     }
 
     Write-Host "Invalid domain format. Try again (example: doom.local)." -ForegroundColor DarkYellow
@@ -513,95 +516,82 @@ function Validate-VIPHttp {
   }
 }
 
-function Install-KubernetesDashboard {
-  param([Parameter(Mandatory)][string]$DashboardHost)
+function Install-Portainer {
+  param([Parameter(Mandatory)][string]$PortainerHost)
 
-  Show-Header "Installing Kubernetes Dashboard (Ingress + token)" "Yellow"
+  Show-Header "Installing Portainer CE (Helm + Ingress)" "Yellow"
 
-  # Official recommended install (manifest). Helm repo has moved/broken frequently; manifest is stable.
-  $dashUrl = "https://raw.githubusercontent.com/kubernetes/dashboard/v2.7.0/aio/deploy/recommended.yaml"
+  $env:KUBECONFIG = $Kubeconfig
 
-  Write-Host "- Applying dashboard manifest..." -ForegroundColor Gray
-  Kube -- apply -f $dashUrl | Out-Null
+  Write-Host "- Adding Portainer Helm repo..." -ForegroundColor Gray
+  helm repo add portainer https://portainer.github.io/k8s/ | Out-Null
+  helm repo update | Out-Null
 
-  Write-Host "- Waiting for dashboard deployment..." -ForegroundColor Gray
-  & kubectl --kubeconfig $Kubeconfig -n kubernetes-dashboard rollout status deployment/kubernetes-dashboard --timeout="240s" | Out-Null
+  Write-Host "- Installing/upgrading Portainer release..." -ForegroundColor Gray
+  helm upgrade --install portainer portainer/portainer `
+    --namespace portainer --create-namespace `
+    --set service.type=ClusterIP | Out-Null
 
-  # Create admin user + clusterrolebinding (lab only)
-  Write-Host "- Creating admin ServiceAccount + binding..." -ForegroundColor Gray
+  Write-Host "- Waiting for Portainer deployment..." -ForegroundColor Gray
+  & kubectl --kubeconfig $Kubeconfig -n portainer rollout status deployment/portainer --timeout="300s" | Out-Null
 
-  $adminYaml = @"
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: dashboard-admin
-  namespace: kubernetes-dashboard
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  name: dashboard-admin
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
-  name: cluster-admin
-subjects:
-- kind: ServiceAccount
-  name: dashboard-admin
-  namespace: kubernetes-dashboard
-"@
+  Write-Host "- Discovering Portainer service port..." -ForegroundColor Gray
+  $svcRaw = & kubectl --kubeconfig $Kubeconfig -n portainer get svc portainer -o json
+  $svcObj = $svcRaw | ConvertFrom-Json
 
-  $tmp = Join-Path $env:TEMP ("dashboard-admin-" + [Guid]::NewGuid().ToString() + ".yaml")
-  Set-Content -Path $tmp -Value $adminYaml -Encoding utf8
-  try {
-    Kube -- apply -f $tmp | Out-Null
-  } finally {
-    Remove-Item -Force -ErrorAction SilentlyContinue $tmp
+  $portainerSvcPort = $null
+  foreach ($p in $svcObj.spec.ports) {
+    if ($p.port -eq 9000) {
+      $portainerSvcPort = 9000
+      break
+    }
+  }
+  if ($null -eq $portainerSvcPort -and $svcObj.spec.ports -and $svcObj.spec.ports.Count -gt 0) {
+    $portainerSvcPort = [int]$svcObj.spec.ports[0].port
+  }
+  if ($null -eq $portainerSvcPort) {
+    throw "Unable to determine Portainer service port."
   }
 
-  # Ingress host can use a local lab domain (recommended) or sslip fallback.
-  $dashHost = $DashboardHost
+  $backendProtocol = if ($portainerSvcPort -eq 9443) { "HTTPS" } else { "HTTP" }
 
-  Write-Host "- Creating Ingress (host: $dashHost)..." -ForegroundColor Gray
+  Write-Host "- Creating Ingress (host: $PortainerHost, port: $portainerSvcPort)..." -ForegroundColor Gray
 
   $ingYaml = @"
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
-  name: dashboard-ingress
-  namespace: kubernetes-dashboard
+  name: portainer-ingress
+  namespace: portainer
   annotations:
-    nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"
+    nginx.ingress.kubernetes.io/backend-protocol: "$backendProtocol"
     nginx.ingress.kubernetes.io/ssl-redirect: "false"
 spec:
   ingressClassName: nginx
   rules:
-  - host: $dashHost
+  - host: $PortainerHost
     http:
       paths:
       - path: /
         pathType: Prefix
         backend:
           service:
-            name: kubernetes-dashboard
+            name: portainer
             port:
-              number: 443
+              number: $portainerSvcPort
 "@
 
-  $tmp2 = Join-Path $env:TEMP ("dashboard-ing-" + [Guid]::NewGuid().ToString() + ".yaml")
-  Set-Content -Path $tmp2 -Value $ingYaml -Encoding utf8
+  $tmp = Join-Path $env:TEMP ("portainer-ing-" + [Guid]::NewGuid().ToString() + ".yaml")
+  Set-Content -Path $tmp -Value $ingYaml -Encoding utf8
   try {
-    Kube -- apply -f $tmp2 | Out-Null
+    Kube -- apply -f $tmp | Out-Null
   } finally {
-    Remove-Item -Force -ErrorAction SilentlyContinue $tmp2
+    Remove-Item -Force -ErrorAction SilentlyContinue $tmp
   }
 
-  # Create token (v1.24+)
   Write-Host ""
-  Write-Host "Dashboard URL: http://$dashHost" -ForegroundColor Cyan
-  Write-Host "If DNS is not configured, add hosts entry: $VipIP $dashHost" -ForegroundColor DarkGray
-  Write-Host "Token (copy/paste into dashboard):" -ForegroundColor Cyan
-  & kubectl --kubeconfig $Kubeconfig -n kubernetes-dashboard create token dashboard-admin
+  Write-Host "Portainer URL: http://$PortainerHost" -ForegroundColor Cyan
+  Write-Host "If DNS is not configured, add hosts entry: $VipIP $PortainerHost" -ForegroundColor DarkGray
 }
 
 function Remove-LocalGeneratedFiles {
@@ -630,7 +620,7 @@ if ($Interactive) {
 }
 
 # Defaults for add-on selectors
-if (-not ($InstallMetalLB -or $InstallIngress -or $InstallApp -or $InstallDashboard)) {
+if (-not ($InstallMetalLB -or $InstallIngress -or $InstallApp -or $InstallPortainer)) {
   $InstallMetalLB = $true
   $InstallIngress = $true
   $InstallApp     = $true
@@ -646,18 +636,18 @@ Write-Host "Workers:        $($WorkerIPs -join ', ')"
 Write-Host "VIP (MetalLB):  $VipIP"
 Write-Host ""
 
-$ResolvedDashboardHost = $null
-if ($DashboardOnly -or $InstallDashboard) {
-  $ResolvedDashboardHost = Resolve-DashboardHost -VipIP $VipIP -ConfiguredDomain $DashboardDomain
-  Write-Host "Dashboard host: $ResolvedDashboardHost" -ForegroundColor DarkGray
+$ResolvedPortainerHost = $null
+if ($PortainerOnly -or $InstallPortainer) {
+  $ResolvedPortainerHost = Resolve-PortainerHost -VipIP $VipIP -ConfiguredDomain $PortainerDomain
+  Write-Host "Portainer host: $ResolvedPortainerHost" -ForegroundColor DarkGray
 }
 
-# Dashboard-only: assumes kubeconfig exists and cluster is reachable
-if ($DashboardOnly) {
-  Show-Header "Dashboard-only mode" "DarkYellow"
+# Portainer-only: assumes kubeconfig exists and cluster is reachable
+if ($PortainerOnly) {
+  Show-Header "Portainer-only mode" "DarkYellow"
   if (-not (Test-Path $Kubeconfig)) { throw "kubeconfig not found at: $Kubeconfig (run bootstrap first)" }
   Ensure-CoreDNSReady
-  Install-KubernetesDashboard -DashboardHost $ResolvedDashboardHost
+  Install-Portainer -PortainerHost $ResolvedPortainerHost
   Write-Host ""
   Write-Host "Done." -ForegroundColor Green
   return
@@ -673,7 +663,7 @@ if ($AddonsOnly) {
   if ($InstallMetalLB) { Install-MetalLB }
   if ($InstallIngress) { Install-IngressNginx }
   if ($InstallApp)     { Install-AppAndIngress }
-  if ($InstallDashboard) { Install-KubernetesDashboard -DashboardHost $ResolvedDashboardHost }
+  if ($InstallPortainer) { Install-Portainer -PortainerHost $ResolvedPortainerHost }
 
   Validate-VIPHttp
 
@@ -743,7 +733,7 @@ if (-not $SkipAddons) {
   if ($InstallMetalLB) { Install-MetalLB }
   if ($InstallIngress) { Install-IngressNginx }
   if ($InstallApp)     { Install-AppAndIngress }
-  if ($InstallDashboard) { Install-KubernetesDashboard -DashboardHost $ResolvedDashboardHost }
+  if ($InstallPortainer) { Install-Portainer -PortainerHost $ResolvedPortainerHost }
 } else {
   Show-Header "Skipping add-ons (SkipAddons set)" "DarkYellow"
 }
