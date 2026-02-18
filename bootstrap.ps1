@@ -343,10 +343,11 @@ $start = Get-Date
 
 while ($true) {
 
-  # Capture BOTH stdout and stderr safely without triggering Stop
+  # Use EndpointSlice instead of deprecated Endpoints API
   $epRaw = & kubectl --kubeconfig $Kubeconfig `
       -n metallb-system `
-      get endpoints metallb-webhook-service `
+      get endpointslice `
+      -l kubernetes.io/service-name=metallb-webhook-service `
       -o json 2>&1
 
   # If kubectl failed entirely, ignore and retry
@@ -361,15 +362,30 @@ while ($true) {
       continue
   }
 
-  # Ignore deprecation warnings and parse JSON only if valid
+  # Parse EndpointSlice JSON structure
   try {
       $jsonStart = $epRaw.IndexOf("{")
       if ($jsonStart -ge 0) {
           $json = $epRaw.Substring($jsonStart)
           $obj = $json | ConvertFrom-Json
 
-          if ($obj.subsets -and $obj.subsets.addresses) {
-              break
+          # EndpointSlice structure: items[].endpoints[].addresses
+          if ($obj.items -and $obj.items.Count -gt 0) {
+              $hasAddresses = $false
+              foreach ($item in $obj.items) {
+                  if ($item.endpoints -and $item.endpoints.Count -gt 0) {
+                      foreach ($ep in $item.endpoints) {
+                          if ($ep.addresses -and $ep.addresses.Count -gt 0) {
+                              $hasAddresses = $true
+                              break
+                          }
+                      }
+                  }
+                  if ($hasAddresses) { break }
+              }
+              if ($hasAddresses) {
+                  break
+              }
           }
       }
   } catch {
